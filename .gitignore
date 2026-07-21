@@ -1,0 +1,4 @@
+# Generated at runtime — never commit
+.env
+secrets/
+!secrets/.gitkeep

@@ -1,0 +1,6 @@
+# BuildBud Caddyfile
+# BB_DOMAIN is set by docker-compose environment
+
+{$BB_DOMAIN} {
+    reverse_proxy buildbud:3001
+}
