@@ -322,7 +322,17 @@ success "License accepted — registry access granted"
 # ─── Start stack ──────────────────────────────────────────────────────────────
 
 info "Starting BuildBud stack..."
-docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d
+# Docker may have just been installed by the prereq step. Wait for the daemon to
+# settle, then bring the stack up. A freshly (re)started dockerd can hit a
+# transient container-name conflict during parallel create (e.g. buildbud-nats);
+# retry once so a spurious first-run race does not abort the whole install under
+# `set -e`. The retry is idempotent — compose reuses already-running containers.
+for _ in $(seq 1 30); do docker info &>/dev/null 2>&1 && break; sleep 1; done
+if ! docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
+  warn "First stack start hit a transient error — retrying once..."
+  sleep 3
+  docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d
+fi
 
 # ─── Wait for Postgres ────────────────────────────────────────────────────────
 info "Waiting for Postgres to be healthy..."
