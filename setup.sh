@@ -20,13 +20,17 @@ DOMAIN="localhost"
 UPGRADE=false
 RESET=false
 LICENSE_FILE=""
+INSTALL_DEPS=true
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --domain) DOMAIN="$2"; shift 2 ;;
     --license) LICENSE_FILE="$2"; shift 2 ;;
+    --claude-token) CLAUDE_CODE_OAUTH_TOKEN="$2"; shift 2 ;;
+    --anthropic-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
     --upgrade) UPGRADE=true; shift ;;
     --reset) RESET=true; shift ;;
+    --no-install-deps) INSTALL_DEPS=false; shift ;;
     *) error "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -38,25 +42,74 @@ echo "  ╚═══════════════════════
 echo ""
 
 # ─── Prerequisites ────────────────────────────────────────────────────────────
+# Fresh-VPS auto-install (Coolify-style) so the whole install is one command.
+# Privileged: installs Docker via the official get.docker.com convenience script
+# and python3/openssl via the distro package manager. These mutate the host and
+# run as root/sudo. Opt out with --no-install-deps for locked-down hosts (then
+# the step only verifies and errors on anything missing).
 info "Checking prerequisites..."
 
-if ! command -v docker &>/dev/null; then
-  error "Docker is not installed. Install it from https://docs.docker.com/get-docker/"
-  exit 1
+# Privilege helper: root -> run direct; else sudo if present.
+if [ "$(id -u)" -eq 0 ]; then SUDO=""
+elif command -v sudo &>/dev/null; then SUDO="sudo"
+else SUDO=""; fi
+_priv() { if [ -n "$SUDO" ]; then $SUDO "$@"; else "$@"; fi; }
+
+detect_pkg_mgr() {
+  if command -v apt-get &>/dev/null; then echo apt
+  elif command -v dnf &>/dev/null; then echo dnf
+  elif command -v yum &>/dev/null; then echo yum
+  elif command -v apk &>/dev/null; then echo apk
+  else echo none; fi
+}
+
+pkg_install() {  # pkg_install <pkg>...
+  case "$(detect_pkg_mgr)" in
+    apt) _priv apt-get update -qq && _priv apt-get install -y -qq "$@" ;;
+    dnf) _priv dnf install -y -q "$@" ;;
+    yum) _priv yum install -y -q "$@" ;;
+    apk) _priv apk add --no-cache "$@" ;;
+    *)   return 1 ;;
+  esac
+}
+
+install_docker() {
+  info "Docker not found — installing via get.docker.com ..."
+  if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO" ]; then
+    error "Installing Docker needs root or sudo. Re-run as root."; exit 1
+  fi
+  curl -fsSL https://get.docker.com | _priv sh
+  _priv systemctl enable --now docker 2>/dev/null \
+    || _priv service docker start 2>/dev/null || true
+}
+
+if $INSTALL_DEPS; then
+  # Base tools the installer + docker script need.
+  for tool in curl tar; do
+    command -v "$tool" &>/dev/null || { info "Installing $tool ..."; pkg_install "$tool" || warn "could not install $tool"; }
+  done
+  command -v docker &>/dev/null || install_docker
+  # get.docker.com bundles the compose plugin; add explicitly if still absent.
+  docker compose version &>/dev/null 2>&1 || pkg_install docker-compose-plugin || true
+  command -v python3 &>/dev/null || { info "Installing python3 ..."; pkg_install python3 || true; }
+  command -v openssl &>/dev/null || { info "Installing openssl ..."; pkg_install openssl || true; }
 fi
 
-if ! docker compose version &>/dev/null 2>&1; then
-  error "Docker Compose v2 is not installed."
-  exit 1
-fi
-
-if ! command -v python3 &>/dev/null; then
-  error "python3 is required for key generation."
-  exit 1
-fi
-
-if ! command -v openssl &>/dev/null; then
-  error "openssl is required for signing key generation."
+# Hard verification — fail clearly if anything is still missing.
+_missing=""
+command -v docker &>/dev/null            || _missing="$_missing docker"
+docker compose version &>/dev/null 2>&1  || _missing="$_missing docker-compose-v2"
+command -v python3 &>/dev/null           || _missing="$_missing python3"
+command -v openssl &>/dev/null           || _missing="$_missing openssl"
+if [ -n "$_missing" ]; then
+  error "Missing prerequisites:$_missing"
+  if $INSTALL_DEPS; then
+    error "Auto-install did not satisfy all deps on this distro. Install manually, then re-run:"
+  else
+    error "--no-install-deps set. Install these manually, then re-run:"
+  fi
+  error "  Docker: curl -fsSL https://get.docker.com | sh"
+  error "  Deps:   <apt-get|dnf|yum|apk> install python3 openssl"
   exit 1
 fi
 
@@ -98,14 +151,19 @@ ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" && -z "$ANTHROPIC_API_KEY" ]]; then
   warn "BuildBud agents need YOUR Claude auth (nothing is sent to us)."
   warn "Get an OAuth token with:  claude setup-token   (or use an Anthropic API key)."
-  read -r -p "Paste CLAUDE_CODE_OAUTH_TOKEN (or leave blank to set ANTHROPIC_API_KEY / edit .env later): " CLAUDE_CODE_OAUTH_TOKEN || true
-  if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
-    read -r -p "Paste ANTHROPIC_API_KEY (or leave blank to configure later in .env): " ANTHROPIC_API_KEY || true
+  # Only prompt on a real terminal. A headless run (piped / nohup) skips cleanly
+  # instead of no-op-reading a blank token into .env.
+  if [ -t 0 ]; then
+    read -r -p "Paste CLAUDE_CODE_OAUTH_TOKEN (or leave blank to set ANTHROPIC_API_KEY / edit .env later): " CLAUDE_CODE_OAUTH_TOKEN || true
+    if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
+      read -r -p "Paste ANTHROPIC_API_KEY (or leave blank to configure later in .env): " ANTHROPIC_API_KEY || true
+    fi
   fi
 fi
 if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" && -z "$ANTHROPIC_API_KEY" ]]; then
-  warn "No Claude auth set — the app will start but agents will fail until you add"
-  warn "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY to .env and re-run --upgrade."
+  warn "No Claude auth set. The app will start, but agents stay idle until you add a token."
+  warn "Easiest: open the app, then Settings -> API Key Setup and paste a token (it persists)."
+  warn "Or: pass --claude-token <tok> (or CLAUDE_CODE_OAUTH_TOKEN=... env), or edit .env + --upgrade."
 fi
 
 info "Generating secrets..."
@@ -238,6 +296,11 @@ if [[ -z "$PULL_TOKEN" ]]; then
   # Persist the whole bundle for the feedback channel (P5/P6) — 0600.
   mkdir -p "$HOME/.buildbud" && chmod 700 "$HOME/.buildbud"
   cp "$LIC" "$HOME/.buildbud/license.json" && chmod 600 "$HOME/.buildbud/license.json"
+  # Extract reportToken/instanceId into .env (0600) so the container app can send
+  # opt-in feedback — it cannot read the host's root:root 0600 license.json directly.
+  REPORT_TOKEN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reportToken",""))' "$LIC" 2>/dev/null || true)
+  INSTANCE_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("instanceId",""))' "$LIC" 2>/dev/null || true)
+  { echo "BB_REPORT_TOKEN=$REPORT_TOKEN"; echo "BB_INSTANCE_ID=$INSTANCE_ID"; } >> "$ENV_FILE"
 fi
 
 # Pin the hub's Ed25519 public key so the instance can verify signed update
@@ -248,6 +311,9 @@ MCowBQYDK2VwAyEA7y2q+nWoBtQGpE4kAuLNJwDGFzFFtI2WtdNp9Qq8Axg=
 -----END PUBLIC KEY-----
 PUBKEY
 chmod 644 "$HOME/.buildbud/hub-signing.pub"
+# Also place the hub key where the container mount expects it (./secrets/hub-signing.pub).
+# Written on every run (incl. --upgrade) so pre-existing installs get the mount source.
+cp "$HOME/.buildbud/hub-signing.pub" "$SECRETS_DIR/hub-signing.pub" && chmod 644 "$SECRETS_DIR/hub-signing.pub"
 
 echo "$PULL_TOKEN" | docker login "$REG_HOST" -u license --password-stdin \
   || { error "Registry login failed. Your license may be expired or revoked — contact the maintainer."; exit 1; }
