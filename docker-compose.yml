@@ -47,6 +47,22 @@ services:
     restart: always
 
   # ============================================
+  # supabase-rest — Supabase-compat proxy for PostgREST
+  # Rewrites /rest/v1/* -> PostgREST root so the app's hardcoded Supabase
+  # /rest/v1 paths resolve against the bare self-host PostgREST.
+  # ============================================
+  supabase-rest:
+    image: caddy:2-alpine
+    container_name: buildbud-supabase-rest
+    configs:
+      - source: supabase_rest_caddyfile
+        target: /etc/caddy/Caddyfile
+    depends_on:
+      postgrest:
+        condition: service_started
+    restart: always
+
+  # ============================================
   # FalkorDB — Graph knowledge store
   # ============================================
   falkordb:
@@ -174,7 +190,7 @@ services:
       FALKORDB_PORT: "6379"
       FALKORDB_PASSWORD: "${FALKORDB_PASSWORD}"
       # Database (PostgREST)
-      SUPABASE_URL: "http://postgrest:3000"
+      SUPABASE_URL: "http://supabase-rest:8000"
       SUPABASE_SERVICE_KEY: "${SERVICE_ROLE_KEY}"
       SUPABASE_ANON_KEY: "${ANON_KEY}"
       SUPABASE_SCHEMA: "public"
@@ -208,6 +224,8 @@ services:
         condition: service_healthy
       postgrest:
         condition: service_started
+      supabase-rest:
+        condition: service_started
       falkordb:
         condition: service_healthy
       nats:
@@ -232,6 +250,21 @@ services:
     depends_on:
       - buildbud
     restart: always
+
+configs:
+  # Inlined so the whole self-host fix lives in this file (synced to the
+  # installer repo). Rewrites the app's hardcoded Supabase /rest/v1 prefix
+  # to the bare self-host PostgREST root.
+  supabase_rest_caddyfile:
+    content: |
+      :8000 {
+      	handle_path /rest/v1/* {
+      		reverse_proxy postgrest:3000
+      	}
+      	handle {
+      		reverse_proxy postgrest:3000
+      	}
+      }
 
 volumes:
   postgres_data:
