@@ -333,6 +333,12 @@ info "Authenticating to the BuildBud registry ($REG_HOST) with your license..."
 PULL_TOKEN="${BB_PULL_TOKEN:-}"
 if [[ -z "$PULL_TOKEN" ]]; then
   LIC="${LICENSE_FILE:-${BB_LICENSE_FILE:-}}"
+  # Re-runs: fall back to the bundle persisted by a previous install so
+  # ./setup.sh without --license keeps working on a configured instance.
+  if [[ -z "$LIC" && -f "$HOME/.buildbud/license.json" ]]; then
+    LIC="$HOME/.buildbud/license.json"
+    info "Using persisted license bundle: $LIC"
+  fi
   if [[ -z "$LIC" ]]; then
     read -r -p "Path to your BuildBud license bundle (.json): " LIC || true
   fi
@@ -340,12 +346,19 @@ if [[ -z "$PULL_TOKEN" ]]; then
   PULL_TOKEN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pullToken"])' "$LIC" 2>/dev/null) \
     || { error "Could not read pullToken from '$LIC' (is it a valid license bundle?)."; exit 1; }
   # Persist the whole bundle for the feedback channel (P5/P6) — 0600.
+  # Skip the copy when --license already points at the persisted bundle:
+  # cp refuses same-file and would abort the script under set -e.
   mkdir -p "$HOME/.buildbud" && chmod 700 "$HOME/.buildbud"
-  cp "$LIC" "$HOME/.buildbud/license.json" && chmod 600 "$HOME/.buildbud/license.json"
+  if [[ "$(readlink -f "$LIC")" != "$(readlink -f "$HOME/.buildbud/license.json" 2>/dev/null || true)" ]]; then
+    cp "$LIC" "$HOME/.buildbud/license.json"
+  fi
+  chmod 600 "$HOME/.buildbud/license.json"
   # Extract reportToken/instanceId into .env (0600) so the container app can send
   # opt-in feedback — it cannot read the host's root:root 0600 license.json directly.
   REPORT_TOKEN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reportToken",""))' "$LIC" 2>/dev/null || true)
   INSTANCE_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("instanceId",""))' "$LIC" 2>/dev/null || true)
+  # Replace, never append: re-runs previously stacked duplicate lines.
+  sed -i '/^BB_REPORT_TOKEN=/d;/^BB_INSTANCE_ID=/d' "$ENV_FILE"
   { echo "BB_REPORT_TOKEN=$REPORT_TOKEN"; echo "BB_INSTANCE_ID=$INSTANCE_ID"; } >> "$ENV_FILE"
 fi
 
