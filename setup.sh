@@ -159,17 +159,32 @@ fi
 
 # ─── Check if already configured ──────────────────────────────────────────────
 if [[ -f "$ENV_FILE" ]]; then
-  warn ".env already exists. Re-running setup will regenerate secrets."
+  warn ".env already exists. Existing secrets will be preserved (re-run refreshes config only)."
   warn "Run with --upgrade to upgrade the app only, --reset to wipe all data."
-  warn "Continue and regenerate secrets? [y/N]"
-  read -r confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || { info "Exiting. Use --upgrade to update the app."; exit 0; }
+  if [ -t 0 ]; then
+    warn "Continue? [y/N]"
+    read -r confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { info "Exiting. Use --upgrade to update the app."; exit 0; }
+  else
+    info "Non-interactive re-run: preserving existing secrets and continuing."
+  fi
 fi
+
+# ─── Preserve existing secrets on re-run ──────────────────────────────────────
+# Rotating secrets on a re-run breaks a live instance: a new BUILDBUD_API_TOKEN
+# locks out web login, a new POSTGRES_PASSWORD no longer matches the existing DB
+# volume, and a new CREDENTIALS_ENCRYPTION_KEY orphans every stored credential.
+# Read prior values from .env; the generators below only fill what is empty.
+_keep() {
+  [ -f "$ENV_FILE" ] || return 0
+  grep -E "^$1=" "$ENV_FILE" | head -1 | cut -d= -f2- || true
+}
 
 # ─── Generate secrets ─────────────────────────────────────────────────────────
 # ─── Claude auth (BYO — required for agents) ──────────────────────────────────
-CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}"
-ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-$(_keep CLAUDE_CODE_OAUTH_TOKEN)}"
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$(_keep ANTHROPIC_API_KEY)}"
+OPENAI_API_KEY="${OPENAI_API_KEY:-$(_keep OPENAI_API_KEY)}"
 if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" && -z "$ANTHROPIC_API_KEY" ]]; then
   warn "BuildBud agents need YOUR Claude auth (nothing is sent to us)."
   warn "Get an OAuth token with:  claude setup-token   (or use an Anthropic API key)."
@@ -192,14 +207,14 @@ info "Generating secrets..."
 mkdir -p "$SECRETS_DIR"
 chmod 700 "$SECRETS_DIR"
 
-# Random passwords/keys
-POSTGRES_PASSWORD=$(openssl rand -hex 24)
-FALKORDB_PASSWORD=$(openssl rand -hex 24)
-JWT_SECRET=$(openssl rand -hex 32)
-CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -hex 32)
-BUILDBUD_API_TOKEN=$(openssl rand -base64 32 | tr -d '+=/' | head -c 40)
-BB_VERIFY_SERVICE_TOKEN=$(openssl rand -hex 24)
-BB_GRAPH_API_TOKEN=$(openssl rand -hex 24)
+# Random passwords/keys — preserved from an existing .env, generated when absent
+POSTGRES_PASSWORD="$(_keep POSTGRES_PASSWORD)"; POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(openssl rand -hex 24)}"
+FALKORDB_PASSWORD="$(_keep FALKORDB_PASSWORD)"; FALKORDB_PASSWORD="${FALKORDB_PASSWORD:-$(openssl rand -hex 24)}"
+JWT_SECRET="$(_keep JWT_SECRET)"; JWT_SECRET="${JWT_SECRET:-$(openssl rand -hex 32)}"
+CREDENTIALS_ENCRYPTION_KEY="$(_keep CREDENTIALS_ENCRYPTION_KEY)"; CREDENTIALS_ENCRYPTION_KEY="${CREDENTIALS_ENCRYPTION_KEY:-$(openssl rand -hex 32)}"
+BUILDBUD_API_TOKEN="$(_keep BUILDBUD_API_TOKEN)"; BUILDBUD_API_TOKEN="${BUILDBUD_API_TOKEN:-$(openssl rand -base64 32 | tr -d '+=/' | head -c 40)}"
+BB_VERIFY_SERVICE_TOKEN="$(_keep BB_VERIFY_SERVICE_TOKEN)"; BB_VERIFY_SERVICE_TOKEN="${BB_VERIFY_SERVICE_TOKEN:-$(openssl rand -hex 24)}"
+BB_GRAPH_API_TOKEN="$(_keep BB_GRAPH_API_TOKEN)"; BB_GRAPH_API_TOKEN="${BB_GRAPH_API_TOKEN:-$(openssl rand -hex 24)}"
 
 # Ed25519 dispatch signing keypair
 openssl genpkey -algorithm ed25519 -out "$SECRETS_DIR/dispatch-signing.pem" 2>/dev/null
