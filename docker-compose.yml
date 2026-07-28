@@ -210,11 +210,13 @@ services:
       BB_FEEDBACK_ENABLED: "${BB_FEEDBACK_ENABLED:-0}"
       BB_FEEDBACK_URL: "${BB_FEEDBACK_URL:-https://feedback.cutclouds.com/feedback}"
       BB_UPDATE_URL: "${BB_UPDATE_URL:-https://feedback.cutclouds.com/updates/ea}"
+      BB_UPDATE_CONTROL_DIR: "/app/.update-control"
       BB_REPORT_TOKEN: "${BB_REPORT_TOKEN:-}"
       BB_INSTANCE_ID: "${BB_INSTANCE_ID:-}"
       BB_HUB_PUBKEY_PATH: "/secrets/hub-signing.pub"
     volumes:
       - app_data:/app/data
+      - ${BB_CONTROL_DIR:-/var/lib/buildbud/update-control}:/app/.update-control
       - app_home:/home/node
       - ./secrets/dispatch-signing.pem:/secrets/dispatch-signing.pem:ro
       - ./secrets/dispatch-signing.pub:/secrets/dispatch-signing.pub:ro

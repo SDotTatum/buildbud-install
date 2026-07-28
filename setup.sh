@@ -5,6 +5,7 @@ set -euo pipefail
 # Usage: ./setup.sh [--domain your.domain.com] [--upgrade] [--reset]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENABLE_ONECLICK="${ENABLE_ONECLICK:-false}"
 ENV_FILE="$SCRIPT_DIR/.env"
 SECRETS_DIR="$SCRIPT_DIR/secrets"
 VERSION="${VERSION:-prod}"
@@ -29,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --claude-token) CLAUDE_CODE_OAUTH_TOKEN="$2"; shift 2 ;;
     --anthropic-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
     --upgrade) UPGRADE=true; shift ;;
+    --enable-one-click-update) ENABLE_ONECLICK=true; shift ;;
     --reset) RESET=true; shift ;;
     --no-install-deps) INSTALL_DEPS=false; shift ;;
     *) error "Unknown option: $1"; exit 1 ;;
@@ -54,6 +56,25 @@ if [ "$(id -u)" -eq 0 ]; then SUDO=""
 elif command -v sudo &>/dev/null; then SUDO="sudo"
 else SUDO=""; fi
 _priv() { if [ -n "$SUDO" ]; then $SUDO "$@"; else "$@"; fi; }
+
+# One-click host updater (design B): app writes a marker, this privileged host
+# systemd path-unit applies the upgrade with DB dump + health gate + auto-rollback.
+# Opt-in via --enable-one-click-update. Without it the Updates panel shows the copy-command.
+install_host_updater() {
+  local CTRL="${BB_CONTROL_DIR:-/var/lib/buildbud/update-control}"
+  info "Installing one-click host updater (privileged, opt-in)..."
+  _priv mkdir -p "$CTRL" /opt/buildbud/updater /etc/buildbud
+  _priv chmod 0777 "$CTRL"   # markers only (non-sensitive); container writes request, host writes status
+  _priv install -m 0755 "$SCRIPT_DIR/updater/buildbud-update-apply.sh" /opt/buildbud/updater/buildbud-update-apply.sh
+  _priv install -m 0644 "$SCRIPT_DIR/updater/buildbud-update-apply.service" /etc/systemd/system/buildbud-update-apply.service
+  _priv install -m 0644 "$SCRIPT_DIR/updater/buildbud-update-apply.path" /etc/systemd/system/buildbud-update-apply.path
+  _priv sed -i "s#/var/lib/buildbud/update-control#${CTRL}#g" /etc/systemd/system/buildbud-update-apply.path
+  printf 'BB_COMPOSE_FILE=%s\nBB_UPDATE_CONTROL_DIR=%s\n' "$SCRIPT_DIR/docker-compose.yml" "$CTRL" | _priv tee /etc/buildbud/updater.env >/dev/null
+  _priv systemctl daemon-reload
+  _priv systemctl enable --now buildbud-update-apply.path
+  _priv touch "$CTRL/.host-updater-ready"
+  success "One-click updater installed (DB dump + health gate + auto-rollback)."
+}
 
 detect_pkg_mgr() {
   if command -v apt-get &>/dev/null; then echo apt
@@ -121,6 +142,7 @@ if $UPGRADE; then
   docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull buildbud
   docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d buildbud
   success "BuildBud upgraded!"
+  [ "$ENABLE_ONECLICK" = true ] && install_host_updater
   exit 0
 fi
 
@@ -268,6 +290,7 @@ ANON_KEY=${ANON_KEY}
 BB_FEEDBACK_ENABLED=${BB_FEEDBACK_ENABLED:-0}
 BB_FEEDBACK_URL=${BB_FEEDBACK_URL:-https://feedback.cutclouds.com/feedback}
 BB_UPDATE_URL=${BB_UPDATE_URL:-https://feedback.cutclouds.com/updates/${LICENSE_CHANNEL:-ea}}
+BB_CONTROL_DIR=${BB_CONTROL_DIR:-/var/lib/buildbud/update-control}
 BB_HUB_PUBKEY_PATH=${HOME}/.buildbud/hub-signing.pub
 BB_LICENSE_PATH=${HOME}/.buildbud/license.json
 EOF
@@ -383,4 +406,5 @@ echo ""
 info "Optional: harden this VPS (SSH + fail2ban + firewall):"
 info "  sudo ./harden.sh            # dry-run preview"
 info "  sudo ./harden.sh --apply    # apply (keep a 2nd session open!)"
+[ "$ENABLE_ONECLICK" = true ] && install_host_updater
 success "Setup complete!"
