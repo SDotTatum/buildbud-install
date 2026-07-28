@@ -18,6 +18,7 @@ error()   { echo -e "${RED}[BuildBud]${NC} $*" >&2; }
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
 DOMAIN="localhost"
+DOMAIN_SET=false
 UPGRADE=false
 RESET=false
 LICENSE_FILE=""
@@ -25,7 +26,7 @@ INSTALL_DEPS=true
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --domain) DOMAIN="$2"; shift 2 ;;
+    --domain) DOMAIN="$2"; DOMAIN_SET=true; shift 2 ;;
     --license) LICENSE_FILE="$2"; shift 2 ;;
     --claude-token) CLAUDE_CODE_OAUTH_TOKEN="$2"; shift 2 ;;
     --anthropic-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
@@ -179,6 +180,13 @@ _keep() {
   [ -f "$ENV_FILE" ] || return 0
   grep -E "^$1=" "$ENV_FILE" | head -1 | cut -d= -f2- || true
 }
+
+# Same preservation for the domain: a re-run without --domain must not reset a
+# configured instance back to localhost (wrong CORS origins -> blank app).
+if ! $DOMAIN_SET; then
+  _prev_domain="$(_keep BB_DOMAIN)"
+  [ -n "$_prev_domain" ] && DOMAIN="$_prev_domain"
+fi
 
 # ─── Generate secrets ─────────────────────────────────────────────────────────
 # ─── Claude auth (BYO — required for agents) ──────────────────────────────────
