@@ -6,6 +6,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENABLE_ONECLICK="${ENABLE_ONECLICK:-false}"
+SEED_STARTER="${SEED_STARTER:-true}"
+STARTER_NAME="${STARTER_NAME:-my-first-app}"
 ENV_FILE="$SCRIPT_DIR/.env"
 SECRETS_DIR="$SCRIPT_DIR/secrets"
 VERSION="${VERSION:-prod}"
@@ -34,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --enable-one-click-update) ENABLE_ONECLICK=true; shift ;;
     --reset) RESET=true; shift ;;
     --no-install-deps) INSTALL_DEPS=false; shift ;;
+    --no-starter-project) SEED_STARTER=false; shift ;;
     *) error "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -61,6 +64,79 @@ _priv() { if [ -n "$SUDO" ]; then $SUDO "$@"; else "$@"; fi; }
 # One-click host updater (design B): app writes a marker, this privileged host
 # systemd path-unit applies the upgrade with DB dump + health gate + auto-rollback.
 # Opt-in via --enable-one-click-update. Without it the Updates panel shows the copy-command.
+# ─── Seed a git-ready starter project (fresh installs only) ───────────────────
+# A brand-new instance otherwise lands the user on an empty board, and the first
+# folder they open is usually git-less -> reactive "Git Repository Required"
+# modal. Seed ONE canonical project that is already a git repo with an initial
+# commit, so isolated worktree builds work on first click.
+# Idempotent: skips when any project is already registered (incl. --upgrade).
+# Opt out with --no-starter-project or SEED_STARTER=false.
+seed_starter_project() {
+  [ "$SEED_STARTER" = true ] || { info "Starter project seeding disabled (--no-starter-project)."; return 0; }
+  info "Seeding starter project \"$STARTER_NAME\"..."
+  local out
+  if ! out=$(docker compose -f "$SCRIPT_DIR/docker-compose.yml" exec -T \
+      -e BB_SEED_NAME="$STARTER_NAME" buildbud node - <<'SEEDJS' 2>&1
+const NAME = process.env.BB_SEED_NAME || 'my-first-app';
+const TOKEN = process.env.BUILDBUD_API_TOKEN || '';
+const BASE = 'http://localhost:' + (process.env.PORT || '3001') + '/api';
+const H = { 'Content-Type': 'application/json' };
+if (TOKEN) H.Authorization = 'Bearer ' + TOKEN;
+const jf = async (p, o) => {
+  const r = await fetch(BASE + p, Object.assign({ headers: H }, o || {}));
+  const t = await r.text();
+  let b; try { b = JSON.parse(t); } catch { b = { raw: t }; }
+  return { status: r.status, body: b };
+};
+(async () => {
+  const list = await jf('/projects');
+  if (list.status !== 200) { console.log('SEED_SKIP cannot list projects (status ' + list.status + ')'); return; }
+  const existing = Array.isArray(list.body && list.body.data) ? list.body.data : [];
+  if (existing.length > 0 && process.env.BB_SEED_FORCE !== '1') {
+    console.log('SEED_SKIP ' + existing.length + ' project(s) already registered');
+    return;
+  }
+  const rootRes = await jf('/projects/default-root');
+  const root = rootRes.body && rootRes.body.data;
+  if (!root) { throw new Error('no default projects root (status ' + rootRes.status + ')'); }
+  const mk = await jf('/projects/create-folder', { method: 'POST', body: JSON.stringify({ location: root, name: NAME, initGit: true }) });
+  const path = require('path');
+  let dir = mk.body && mk.body.data;
+  if (!dir && mk.status === 409) { dir = path.join(root, NAME); console.log('SEED_INFO reusing existing folder ' + dir); }
+  if (!dir) { throw new Error('create-folder failed (status ' + mk.status + ')'); }
+  // Give the initial commit something to contain.
+  const fs = require('fs');
+  const readme = path.join(dir, 'README.md');
+  if (!fs.existsSync(readme)) {
+    fs.writeFileSync(readme, '# ' + NAME + '\n\nYour first BuildBud project.\n\n' +
+      'BuildBud builds in isolated git worktrees, so this folder is already a git\n' +
+      'repository with one initial commit. Describe what you want built on the\n' +
+      'Kanban board or in Chat, and BuildBud takes it from there.\n\n' +
+      'Rename or delete this project any time - it is only here so your first\n' +
+      'build has somewhere to run.\n');
+  }
+  const ignore = path.join(dir, '.gitignore');
+  if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, 'node_modules/\n.env\ndist/\n');
+  const add = await jf('/projects', { method: 'POST', body: JSON.stringify({ path: dir, name: NAME }) });
+  const proj = add.body && add.body.data;
+  if (!proj || !proj.id) { throw new Error('register failed (status ' + add.status + ')'); }
+  const gi = await jf('/projects/' + proj.id + '/git/init', { method: 'POST' });
+  const g = (gi.body && gi.body.data) || {};
+  console.log('SEED_OK ' + dir + ' id=' + proj.id + ' git=' + gi.status + ' hasCommits=' + !!g.hasCommits);
+})().catch(e => { console.log('SEED_FAIL ' + ((e && e.message) || String(e))); process.exit(1); });
+SEEDJS
+  ); then
+    warn "Could not seed the starter project (non-fatal): ${out:-unknown error}"
+    warn "Create one in the app: New Project -> Start a new app."
+    return 0
+  fi
+  case "$out" in
+    *SEED_OK*)   success "Starter project ready: $STARTER_NAME (git initialized, first commit made)." ;;
+    *SEED_SKIP*) info "Starter project not needed (${out#*SEED_SKIP })." ;;
+    *)           warn "Starter project seeding returned: $out" ;;
+  esac
+}
+
 install_host_updater() {
   local CTRL="${BB_CONTROL_DIR:-/var/lib/buildbud/update-control}"
   info "Installing one-click host updater (privileged, opt-in)..."
@@ -421,6 +497,11 @@ until docker compose -f "$SCRIPT_DIR/docker-compose.yml" exec -T buildbud sh -lc
   sleep 3
 done
 [[ $APP_WAIT -lt 90 ]] && success "App is answering /api/health"
+
+# Seed a starter project only when the app actually answered (needs the API).
+if [[ $APP_WAIT -lt 90 ]]; then
+  seed_starter_project
+fi
 
 # ─── Print access info ────────────────────────────────────────────────────────
 echo ""
