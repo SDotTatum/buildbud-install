@@ -107,8 +107,16 @@ services:
   # ============================================
   graph-api:
     image: ${REGISTRY:-hub.cutclouds.com}/buildbud:${VERSION:-latest}
-    # Optional sidecar (memory-graph read API for Insights). Its script is not in
-    # the current release image (gap G-j) — start with `--profile graph` once fixed.
+    # Optional sidecar (memory-graph read API for Insights).
+    # CORRECTION 2026-08-03: scripts/graph_api.py IS in the release image (gap
+    # G-j is stale). The real blocker is DATA: /app/graph is not shipped --
+    # chunks.json and links.json are gitignored build artifacts -- and nothing
+    # in a self-host install generates them. Starting `--profile graph` today
+    # yields a service whose file-backed routes read nothing and whose
+    # graph-backed routes query an empty FalkorDB.
+    # Making this real needs the indexing pipeline (parse_and_chunk ->
+    # trace_and_link -> import_to_graph -> graph_algorithms) to run on the
+    # instance, as it now does on bb-app and bb-coder.
     profiles: ["graph"]
     container_name: buildbud-graph-api
     entrypoint: []
