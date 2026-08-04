@@ -216,8 +216,40 @@ success "Prerequisites OK"
 # ─── Upgrade path ─────────────────────────────────────────────────────────────
 if $UPGRADE; then
   info "Upgrading BuildBud..."
+
+  # Refresh docker-compose.yml from the published bundle.
+  #
+  # Without this an upgrade only ever pulls a new app image, so a fix that lives
+  # in the compose can never reach an existing install. That is not theoretical:
+  # the FalkorDB volume was mounted at /data while Redis writes to
+  # /var/lib/falkordb/data, meaning NO self-host instance persisted its agent
+  # memory, and every upgrade that recreated the container silently destroyed it.
+  # The fix shipped, and would have reached nobody.
+  #
+  # The local file is always backed up first. Configuration belongs in .env, not
+  # in this file, so replacing it is safe; if you did customise it, the backup
+  # printed below is your copy.
+  COMPOSE_URL="${BB_COMPOSE_URL:-https://raw.githubusercontent.com/SDotTatum/buildbud-install/main/docker-compose.yml}"
+  _new_compose="$(mktemp)"
+  if curl -fsSL --max-time 30 "$COMPOSE_URL" -o "$_new_compose" 2>/dev/null \
+     && grep -q '^services:' "$_new_compose"; then
+    if ! cmp -s "$_new_compose" "$SCRIPT_DIR/docker-compose.yml"; then
+      _bak="$SCRIPT_DIR/docker-compose.yml.bak-upgrade-$(date +%Y%m%d-%H%M%S)"
+      cp "$SCRIPT_DIR/docker-compose.yml" "$_bak"
+      cp "$_new_compose" "$SCRIPT_DIR/docker-compose.yml"
+      info "Updated docker-compose.yml from the published bundle (previous: $_bak)"
+    fi
+  else
+    # Not fatal: an upgrade that cannot reach GitHub should still update the app.
+    warn "Could not refresh docker-compose.yml from $COMPOSE_URL — continuing with the local copy"
+  fi
+  rm -f "$_new_compose"
+
   docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull buildbud
-  docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d buildbud
+  # `up -d` over the whole stack, not just buildbud: a refreshed compose can
+  # change any service definition, and compose only recreates what actually
+  # differs, so unchanged services are left running.
+  docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d
   success "BuildBud upgraded!"
   [ "$ENABLE_ONECLICK" = true ] && install_host_updater
   exit 0
