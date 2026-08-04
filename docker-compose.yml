@@ -70,8 +70,18 @@ services:
     container_name: buildbud-falkordb
     command: ["--save", "900", "1"]
     environment:
-      REDIS_ARGS: "--requirepass ${FALKORDB_PASSWORD}"
+      # AOF, not snapshots alone. With only `--save 900 1` a self-hoster loses up
+      # to 15 minutes of agent memory on any restart, and everything on a crash.
+      # appendfsync everysec caps the loss at one second.
+      REDIS_ARGS: "--requirepass ${FALKORDB_PASSWORD} --appendonly yes --appendfsync everysec"
     volumes:
+      # Redis `dir` is /var/lib/falkordb/data. Mounting the volume only at /data
+      # meant NOTHING was persisted: the RDB and AOF were written to the
+      # container layer, so every `setup.sh --upgrade` that recreated this
+      # container silently destroyed the agent-memory graph. Verified on a live
+      # self-host instance -- /var/lib/falkordb/data was empty while the volume
+      # held nothing but an unused directory.
+      - falkordb_data:/var/lib/falkordb/data
       - falkordb_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${FALKORDB_PASSWORD}", "ping"]
