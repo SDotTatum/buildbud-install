@@ -193,16 +193,21 @@ services:
       # Codex provider (optional, BYO OpenAI key). Claude is the default agent;
       # set OPENAI_API_KEY to enable the bundled @openai/codex CLI as a provider.
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      # Agent memory (graphiti). Embedder is local (fastembed) — no key needed.
-      # The LLM path is OpenAI-compatible: by default it reuses your OPENAI_API_KEY
-      # (the same key Codex uses) against OpenAI. Claude-only users can point
-      # GRAPHITI_LLM_* at any OpenAI-compatible endpoint (OpenRouter, litellm, ...).
-      # Opt-in: set GRAPHITI_ENABLED=true and provide a key.
+      # Agent memory (graphiti). Both halves are keyless by default:
+      #   embeddings -> local fastembed (ONNX), in-process
+      #   extraction -> your Claude subscription, through the bundled Claude CLI
+      # Nothing here needs an API key, and no second bill. This used to default to
+      # OpenAI (gpt-4o-mini against api.openai.com) because the subscription path
+      # only existed as host infrastructure on our own fleet; it now ships in the
+      # image, so every install gets it.
+      # To use a different LLM instead, set GRAPHITI_LLM_BASE_URL (plus _API_KEY and
+      # _MODEL) to any OpenAI-compatible endpoint — OpenRouter, litellm, Ollama,
+      # OpenAI. When set it takes precedence over the subscription.
       GRAPHITI_ENABLED: "${GRAPHITI_ENABLED:-false}"
-      GRAPHITI_LLM_BASE_URL: "${GRAPHITI_LLM_BASE_URL:-https://api.openai.com/v1}"
-      GRAPHITI_LLM_API_KEY: "${GRAPHITI_LLM_API_KEY:-${OPENAI_API_KEY:-}}"
-      GRAPHITI_LLM_MODEL: "${GRAPHITI_LLM_MODEL:-gpt-4o-mini}"
-      GRAPHITI_LLM_SMALL_MODEL: "${GRAPHITI_LLM_SMALL_MODEL:-gpt-4o-mini}"
+      GRAPHITI_LLM_BASE_URL: "${GRAPHITI_LLM_BASE_URL:-}"
+      GRAPHITI_LLM_API_KEY: "${GRAPHITI_LLM_API_KEY:-}"
+      GRAPHITI_LLM_MODEL: "${GRAPHITI_LLM_MODEL:-}"
+      GRAPHITI_LLM_SMALL_MODEL: "${GRAPHITI_LLM_SMALL_MODEL:-}"
       GRAPHITI_DATABASE: "buildbud_user"
       FALKORDB_HOST: "falkordb"
       FALKORDB_PORT: "6379"
