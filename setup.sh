@@ -552,6 +552,18 @@ echo "  ║  Upgrade: ./setup.sh --upgrade                       ║"
 echo "  ║  Reset:   ./setup.sh --reset                         ║"
 echo "  ╚══════════════════════════════════════════════════════╝"
 echo ""
+# G42: state the return edge out loud. It ships OFF, and an installer that
+# never mentions it leaves the operator with no way to know a choice was made.
+FEEDBACK_STATE="${BB_FEEDBACK_ENABLED:-0}"
+if [[ "$FEEDBACK_STATE" == "1" ]]; then
+  info "Learning reports: ON — build learnings are sent to ${BB_FEEDBACK_URL:-the BuildBud hub}"
+  info "  Turn off: set BB_FEEDBACK_ENABLED=0 in .env, then docker compose up -d buildbud"
+else
+  info "Learning reports: OFF — nothing about your builds leaves this machine"
+  info "  Turn on:  set BB_FEEDBACK_ENABLED=1 in .env, then docker compose up -d buildbud"
+fi
+info "  Check:    curl -H \"Authorization: Bearer \$TOKEN\" http://localhost/api/feedback/status"
+echo ""
 info "Optional: harden this VPS (SSH + fail2ban + firewall):"
 info "  sudo ./harden.sh            # dry-run preview"
 info "  sudo ./harden.sh --apply    # apply (keep a 2nd session open!)"
