@@ -18,6 +18,81 @@ success() { echo -e "${GREEN}[BuildBud]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[BuildBud]${NC} $*"; }
 error()   { echo -e "${RED}[BuildBud]${NC} $*" >&2; }
 
+# ─── Diagnosis helpers ────────────────────────────────────────────────────────
+# Pure-ish helpers, unit-tested by install/__tests__/setup-lib.test.sh. They
+# exist because the installer used to state things it had never checked: it
+# printed "Prerequisites OK" without ever talking to the Docker API, retried
+# errors that can never succeed on a retry, and printed a URL it had never
+# fetched. Each helper answers exactly one question, so the answer can be tested.
+
+# Can we actually TALK to the Docker daemon? The binary existing says nothing.
+# Echoes: ok | permission | nodaemon | unknown
+docker_api_state() {
+  local out
+  if out="$(docker info 2>&1)"; then
+    echo ok
+    return 0
+  fi
+  case "$out" in
+    *"permission denied"*)                                        echo permission ;;
+    *"Cannot connect to the Docker daemon"*|*"docker daemon running"*) echo nodaemon ;;
+    *)                                                            echo unknown ;;
+  esac
+}
+
+# Is a stack-start failure worth retrying? Retrying a permission denial or a
+# port conflict only delays and hides the real message (G39).
+# Echoes: transient | permission | port-conflict | permanent
+classify_stack_error() {
+  local out="$1"
+  case "$out" in
+    *"permission denied while trying to connect to the Docker daemon"*|*"Got permission denied while trying"*)
+      echo permission ;;
+    *"address already in use"*|*"port is already allocated"*|*"failed to bind host port"*|*"Bind for "*"failed"*)
+      echo port-conflict ;;
+    *"denied: requested access to the resource is denied"*|*"unauthorized: "*|*"manifest unknown"*|*"no space left on device"*)
+      echo permanent ;;
+    *"Conflict. The container name"*|*"TLS handshake timeout"*|*"i/o timeout"*|*"connection reset by peer"*|*"toomanyrequests"*|*"net/http: request canceled"*|*"context deadline exceeded"*)
+      echo transient ;;
+    *)
+      echo permanent ;;
+  esac
+}
+
+# Fetch a URL and echo the HTTP status code. 000 means "nothing answered" —
+# curl's own convention, kept so a caller cannot mistake it for a real code.
+probe_http() {
+  # curl already writes 000 when nothing answers; do not add a second 000 on
+  # its non-zero exit. Empty output (no curl at all) becomes 000 too.
+  local code
+  code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time "${2:-6}" "$1" 2>/dev/null)"
+  echo "${code:-000}"
+}
+
+# Does a status code mean the entry point is serving? A 401/403 does: the app
+# answered and asked for auth. A 000 or a 5xx does not.
+entry_ok() {
+  case "${1:-000}" in
+    2[0-9][0-9]|3[0-9][0-9]|4[0-9][0-9]) return 0 ;;   # something served it
+    *) return 1 ;;                                     # 000 = nothing, 5xx = broken
+  esac
+}
+
+# Who is holding a host port? Used to explain a bind conflict instead of just
+# reporting one. Best-effort: prints nothing when no tool is available.
+port_holders() {
+  local port="$1"
+  if command -v ss &>/dev/null; then
+    ss -lntp 2>/dev/null | awk -v p=":$port\$" '$4 ~ p'
+  elif command -v lsof &>/dev/null; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null
+  fi
+}
+
+# Sourced by install/__tests__: define the helpers above, then stop. Nothing
+# below this line runs, so the tests cannot install anything.
+if [ -n "${BB_SETUP_LIB_ONLY:-}" ]; then return 0 2>/dev/null || exit 0; fi
+
 # ─── Argument parsing ─────────────────────────────────────────────────────────
 DOMAIN="localhost"
 DOMAIN_SET=false
@@ -210,6 +285,28 @@ if [ -n "$_missing" ]; then
   error "  Deps:   <apt-get|dnf|yum|apk> install python3 openssl"
   exit 1
 fi
+
+# A docker binary on PATH is not Docker access. Every step after this one talks
+# to the daemon, so check that here — with the remedy — instead of dying 200
+# lines later on a raw socket error (G38). Docker may have just been installed,
+# so give the daemon a moment to come up before judging it.
+for _ in $(seq 1 30); do docker info &>/dev/null 2>&1 && break; sleep 1; done
+case "$(docker_api_state)" in
+  ok) ;;
+  permission)
+    error "Docker is installed but this user cannot use it (permission denied on /var/run/docker.sock)."
+    error "  Remedy:  sudo usermod -aG docker $(id -un) && newgrp docker"
+    error "  Or re-run this installer with sudo."
+    exit 1 ;;
+  nodaemon)
+    error "Docker is installed but the daemon is not running."
+    error "  Remedy:  sudo systemctl enable --now docker"
+    exit 1 ;;
+  *)
+    error "Docker is installed but 'docker info' failed:"
+    docker info 2>&1 | tail -5 >&2
+    exit 1 ;;
+esac
 
 success "Prerequisites OK"
 
@@ -489,17 +586,42 @@ success "License accepted — registry access granted"
 # ─── Start stack ──────────────────────────────────────────────────────────────
 
 info "Starting BuildBud stack..."
-# Docker may have just been installed by the prereq step. Wait for the daemon to
-# settle, then bring the stack up. A freshly (re)started dockerd can hit a
-# transient container-name conflict during parallel create (e.g. buildbud-nats);
-# retry once so a spurious first-run race does not abort the whole install under
-# `set -e`. The retry is idempotent — compose reuses already-running containers.
-for _ in $(seq 1 30); do docker info &>/dev/null 2>&1 && break; sleep 1; done
-if ! docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d; then
-  warn "First stack start hit a transient error — retrying once..."
-  sleep 3
-  docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d
+# A freshly (re)started dockerd can hit a transient container-name conflict
+# during parallel create (e.g. buildbud-nats), so one retry is worth it. But a
+# permission denial or a port conflict can NEVER succeed on a retry: retrying
+# them only delays the install and buries the message that would have fixed it
+# (G39). Classify first, retry only what a retry can help. Daemon reachability
+# was already established in the prerequisite block.
+STACK_LOG="$(mktemp)"
+if ! docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d 2>&1 | tee "$STACK_LOG"; then
+  case "$(classify_stack_error "$(cat "$STACK_LOG")")" in
+    transient)
+      warn "First stack start hit a transient error — retrying once..."
+      sleep 3
+      docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d
+      ;;
+    permission)
+      error "Docker refused the connection: permission denied on the daemon socket."
+      error "  Remedy:  sudo usermod -aG docker $(id -un) && newgrp docker"
+      rm -f "$STACK_LOG"; exit 1
+      ;;
+    port-conflict)
+      error "A host port BuildBud needs (80/443) is already in use."
+      for _p in 80 443; do
+        _h="$(port_holders "$_p")"
+        [ -n "$_h" ] && { error "  :$_p held by:"; echo "$_h" >&2; }
+      done
+      error "  Free the port, or put BuildBud behind your existing proxy and"
+      error "  remove the caddy 'ports:' mapping from docker-compose.yml."
+      rm -f "$STACK_LOG"; exit 1
+      ;;
+    *)
+      error "Stack start failed. The message above is the cause — a retry would not change it."
+      rm -f "$STACK_LOG"; exit 1
+      ;;
+  esac
 fi
+rm -f "$STACK_LOG"
 
 # ─── Wait for Postgres ────────────────────────────────────────────────────────
 info "Waiting for Postgres to be healthy..."
@@ -535,15 +657,30 @@ if [[ $APP_WAIT -lt 90 ]]; then
   seed_starter_project
 fi
 
+# ─── Probe the entry point, THEN print it ─────────────────────────────────────
+# The installer used to end with "BuildBud is running!" and a URL it had never
+# fetched. Measured on a real install (bb-team, 2026-08-19): that URL answered
+# 000 while every check the installer did run was green, because the health
+# probe goes through the compose network and never through the entry point the
+# user is told to open (G37). Probe what we advertise, and when it does not
+# answer, say what does.
+if [[ "$DOMAIN" == "localhost" ]]; then ENTRY_URL="http://localhost"; else ENTRY_URL="https://${DOMAIN}"; fi
+info "Probing ${ENTRY_URL} ..."
+ENTRY_CODE="$(probe_http "$ENTRY_URL")"
+
 # ─── Print access info ────────────────────────────────────────────────────────
 echo ""
 echo "  ╔══════════════════════════════════════════════════════╗"
-echo "  ║         BuildBud is running!                         ║"
-echo "  ╠══════════════════════════════════════════════════════╣"
-if [[ "$DOMAIN" == "localhost" ]]; then
-  echo "  ║  URL:   http://localhost                             ║"
+if entry_ok "$ENTRY_CODE"; then
+  echo "  ║         BuildBud is running!                         ║"
 else
-  echo "  ║  URL:   https://${DOMAIN}"
+  echo "  ║   BuildBud started — entry point NOT reachable        ║"
+fi
+echo "  ╠══════════════════════════════════════════════════════╣"
+if entry_ok "$ENTRY_CODE"; then
+  printf "  ║  URL:   %-45s║\n" "$ENTRY_URL (HTTP $ENTRY_CODE)"
+else
+  printf "  ║  URL:   %-45s║\n" "$ENTRY_URL (no answer)"
 fi
 echo "  ║  Token: ${BUILDBUD_API_TOKEN}"
 echo "  ╠══════════════════════════════════════════════════════╣"
@@ -552,6 +689,28 @@ echo "  ║  Upgrade: ./setup.sh --upgrade                       ║"
 echo "  ║  Reset:   ./setup.sh --reset                         ║"
 echo "  ╚══════════════════════════════════════════════════════╝"
 echo ""
+if ! entry_ok "$ENTRY_CODE"; then
+  error "${ENTRY_URL} did not answer (curl status ${ENTRY_CODE}). The stack is up but"
+  error "the front door is not. What IS reachable:"
+  _direct="$(probe_http "http://127.0.0.1:3001/api/health")"
+  if entry_ok "$_direct"; then
+    error "  http://127.0.0.1:3001/api/health -> HTTP ${_direct}  (the app itself is fine)"
+  else
+    error "  http://127.0.0.1:3001/api/health -> ${_direct}  (the app is not answering either)"
+  fi
+  _pub="$(docker compose -f "$SCRIPT_DIR/docker-compose.yml" port caddy 80 2>/dev/null || true)"
+  if [ -z "$_pub" ]; then
+    error "  caddy publishes no host port — something else already holds :80/:443."
+    for _p in 80 443; do
+      _h="$(port_holders "$_p")"
+      [ -n "$_h" ] && { error "  :$_p held by:"; echo "$_h" >&2; }
+    done
+    error "  Fix: free the port, or drop caddy's 'ports:' mapping and proxy to it yourself."
+  else
+    error "  caddy is published on ${_pub} — try that address, or check: docker compose logs caddy"
+  fi
+  echo ""
+fi
 # G42: state the return edge out loud. It ships OFF, and an installer that
 # never mentions it leaves the operator with no way to know a choice was made.
 FEEDBACK_STATE="${BB_FEEDBACK_ENABLED:-0}"
