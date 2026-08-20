@@ -275,6 +275,21 @@ services:
     depends_on:
       - buildbud
     restart: always
+    # Probe the app THROUGH caddy, not caddy itself. A caddy that is up but
+    # detached from the app network still accepts connections on :80 and still
+    # reports "running" to docker, which is how an instance reached "healthy"
+    # with no working ingress at all (G60). Asserting on the body means a 502
+    # from a broken upstream fails the check instead of passing it.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -O- --header="Host: $${BB_DOMAIN#*://}" http://127.0.0.1/api/health
+          | grep -q '"status":"healthy"'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 configs:
   # Inlined so the whole self-host fix lives in this file (synced to the
