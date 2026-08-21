@@ -2,11 +2,12 @@
 set -euo pipefail
 
 # BuildBud Self-Hosted Setup
-# Usage: ./setup.sh [--domain your.domain.com] [--upgrade] [--reset]
+# Usage: ./setup.sh [--domain your.domain.com] [--upgrade] [--reset] [--self-update]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENABLE_ONECLICK="${ENABLE_ONECLICK:-false}"
 SEED_STARTER="${SEED_STARTER:-true}"
+SELF_UPDATE=false
 STARTER_NAME="${STARTER_NAME:-my-first-app}"
 ENV_FILE="$SCRIPT_DIR/.env"
 SECRETS_DIR="$SCRIPT_DIR/secrets"
@@ -114,6 +115,51 @@ show_api_token() {
   echo "$tok"
 }
 
+# ─── Install-tree freshness (G72) ─────────────────────────────────────────────
+# `docker compose pull` updates the APPLICATION IMAGE and nothing else. The
+# install tree -- this script, the compose file, the Caddyfile, the updater --
+# is whatever bootstrap.sh downloaded on the day of the install, and nothing
+# ever refreshes it. So every installer fix (G37 unprobed URL, G39 retrying
+# permanent errors, G40 wrong directory name, G42 feedback banner, G61
+# --show-token) reaches NEW installs only and is invisible to every instance
+# already in the field. Measured on the real bb-team instance: `./setup.sh
+# --show-token` answers "Unknown option", although the flag has been in the
+# upstream install repo since it merged.
+#
+# These helpers are above the LIB_ONLY line so install/__tests__ can drive them.
+
+BB_INSTALL_TARBALL="${BB_INSTALL_TARBALL:-https://github.com/SDotTatum/buildbud-install/archive/refs/heads/main.tar.gz}"
+
+# Files that belong to the TOOLING and may be replaced wholesale. Everything
+# else in the install dir -- .env, secrets/, data/, docker-compose.override.yml
+# -- is instance state and is never touched by a tree refresh.
+bb_tree_tooling_files() {
+  printf '%s\n' setup.sh bootstrap.sh docker-compose.yml Caddyfile harden.sh \
+    PRE-ALPHA-ACCESS.md INSTALL-GUIDE.md README.md
+}
+
+# Is a candidate directory a plausible install tree? A refresh that overwrote a
+# live install with a half-downloaded or wrong tarball would be worse than a
+# stale one, so this is checked before anything is copied.
+# Echoes: ok | missing-setup | missing-compose
+bb_tree_looks_valid() {
+  local dir="$1"
+  [ -f "$dir/setup.sh" ]           || { echo missing-setup; return 1; }
+  [ -f "$dir/docker-compose.yml" ] || { echo missing-compose; return 1; }
+  echo ok
+}
+
+# Compare two setup.sh files by the flags they accept, which is the property an
+# operator actually cares about ("does my copy have --show-token?"). Echoes the
+# flags present upstream and absent locally, one per line; empty when current.
+bb_tree_missing_flags() {
+  local local_setup="$1" upstream_setup="$2"
+  local up loc
+  up="$(grep -oE '^\s+--[a-z-]+\)' "$upstream_setup" 2>/dev/null | tr -d ' )' | sort -u)"
+  loc="$(grep -oE '^\s+--[a-z-]+\)' "$local_setup" 2>/dev/null | tr -d ' )' | sort -u)"
+  comm -23 <(printf '%s\n' "$up") <(printf '%s\n' "$loc")
+}
+
 # Sourced by install/__tests__: define the helpers above, then stop. Nothing
 # below this line runs, so the tests cannot install anything.
 if [ -n "${BB_SETUP_LIB_ONLY:-}" ]; then return 0 2>/dev/null || exit 0; fi
@@ -139,6 +185,7 @@ while [[ $# -gt 0 ]]; do
     --no-install-deps) INSTALL_DEPS=false; shift ;;
     --no-starter-project) SEED_STARTER=false; shift ;;
     --show-token) SHOW_TOKEN=true; shift ;;
+    --self-update) SELF_UPDATE=true; shift ;;
     *) error "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -151,6 +198,52 @@ done
 # out of their own instance with no documented way back in (G61).
 if [ "$SHOW_TOKEN" = true ]; then
   show_api_token "$ENV_FILE" || exit 1
+  exit 0
+fi
+
+# --self-update: refresh the install TOOLING from upstream (G72). The image and
+# the tree are two different things; this updates the tree, and only the tree.
+# Instance state (.env, secrets/, data/, docker-compose.override.yml) is never
+# touched. The script does not re-exec itself afterwards -- a script replacing
+# itself mid-run is how an interrupted update leaves an unusable installer --
+# so it reports what changed and asks for a re-run.
+if [ "$SELF_UPDATE" = true ]; then
+  info "Refreshing install tooling from $BB_INSTALL_TARBALL"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  if ! curl -fsSL "$BB_INSTALL_TARBALL" | tar xz -C "$tmp" 2>/dev/null; then
+    error "Could not download the install bundle. Tree left untouched."
+    exit 1
+  fi
+  src="$(find "$tmp" -maxdepth 2 -name setup.sh -printf '%h\n' 2>/dev/null | head -1)"
+  if [ -z "$src" ]; then
+    error "Downloaded bundle contains no setup.sh. Tree left untouched."
+    exit 1
+  fi
+  state="$(bb_tree_looks_valid "$src")" || {
+    error "Downloaded bundle is not a valid install tree ($state). Tree left untouched."
+    exit 1
+  }
+
+  missing="$(bb_tree_missing_flags "$SCRIPT_DIR/setup.sh" "$src/setup.sh")"
+  backup="$SCRIPT_DIR/.tooling-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$backup"
+  while IFS= read -r f; do
+    [ -e "$SCRIPT_DIR/$f" ] && cp -a "$SCRIPT_DIR/$f" "$backup/" 2>/dev/null || true
+    [ -e "$src/$f" ] && cp -a "$src/$f" "$SCRIPT_DIR/$f" 2>/dev/null || true
+  done < <(bb_tree_tooling_files)
+  [ -d "$src/updater" ] && cp -a "$src/updater/." "$SCRIPT_DIR/updater/" 2>/dev/null || true
+  chmod +x "$SCRIPT_DIR/setup.sh" 2>/dev/null || true
+
+  success "Install tooling refreshed. Previous copies: $backup"
+  if [ -n "$missing" ]; then
+    info "Flags this instance did not have before:"
+    printf '  %s\n' $missing
+  else
+    info "No new flags — the tooling was already current."
+  fi
+  info "Instance state (.env, secrets/, data/) was not touched."
+  info "Re-run ./setup.sh --upgrade to apply the refreshed tooling."
   exit 0
 fi
 
