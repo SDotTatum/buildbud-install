@@ -493,12 +493,44 @@ if $UPGRADE; then
   fi
   rm -f "$_new_compose"
 
+  # Record the image we are replacing, so it can be kept as a rollback target
+  # when the orphan prune runs below.
+  _prev_img="$(docker inspect buildbud-app --format '{{.Image}}' 2>/dev/null || true)"
+
   docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull buildbud
   # `up -d` over the whole stack, not just buildbud: a refreshed compose can
   # change any service definition, and compose only recreates what actually
   # differs, so unchanged services are left running.
   docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d
-  success "BuildBud upgraded!"
+
+  # Confirm the upgrade before claiming it. This used to print "BuildBud
+  # upgraded!" the instant `up -d` returned, which says only that compose
+  # accepted the command -- the same shape as G37, where the installer declared
+  # success on a URL it had never fetched.
+  # Bounded, and bounded by a knob. 60 x 3s is three minutes of silence on an
+  # upgrade that has already failed, and it made the behavioural test unable to
+  # exercise the unhealthy path at all.
+  _up_ok=false
+  for _ in $(seq 1 "${BB_UPGRADE_HEALTH_TRIES:-60}"); do
+    if docker compose -f "$SCRIPT_DIR/docker-compose.yml" exec -T buildbud \
+         sh -lc 'wget -qO- http://localhost:3001/api/health >/dev/null 2>&1 || curl -sf http://localhost:3001/api/health >/dev/null 2>&1' 2>/dev/null; then
+      _up_ok=true; break
+    fi
+    sleep 3
+  done
+
+  if [ "$_up_ok" = true ]; then
+    success "BuildBud upgraded and answering /api/health"
+    # Reclaim what this upgrade orphaned -- ONLY now. Until health is confirmed
+    # the previous image is the rollback target, and pruning it would turn a bad
+    # upgrade into an unrecoverable one.
+    info "Reclaiming orphaned images: $(bb_prune_orphaned_images "$_prev_img")"
+  else
+    warn "Upgrade applied but the app is not answering /api/health yet."
+    warn "NOT reclaiming old images -- the previous one is your rollback target."
+    warn "Check: docker compose -f \"$SCRIPT_DIR/docker-compose.yml\" logs --tail=50 buildbud"
+  fi
+
   [ "$ENABLE_ONECLICK" = true ] && install_host_updater
   exit 0
 fi

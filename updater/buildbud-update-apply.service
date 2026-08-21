@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply a requested BuildBud update (host-side, privileged)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/buildbud/updater.env
+ExecStart=/opt/buildbud/updater/buildbud-update-apply.sh
