@@ -133,6 +133,26 @@ BB_INSTALL_TARBALL="${BB_INSTALL_TARBALL:-https://github.com/SDotTatum/buildbud-
 # Files that belong to the TOOLING and may be replaced wholesale. Everything
 # else in the install dir -- .env, secrets/, data/, docker-compose.override.yml
 # -- is instance state and is never touched by a tree refresh.
+# Reclaim images orphaned by an upgrade (G84).
+#
+# `docker compose pull` re-points the tag and leaves the previous image
+# untagged; nothing removed them, so an instance gained roughly one 4.4GB layer
+# set per upgrade until the disk filled. Measured on a real install: 38G disk at
+# 95%, 26.8GB unused, and a pull that died with `no space left on device`.
+#
+# Only ever called AFTER the new container is confirmed healthy. Before that the
+# previous image is the rollback target, and removing it would turn a failed
+# upgrade into an unrecoverable one. One rollback target is deliberately kept.
+bb_prune_orphaned_images() {
+  local prev="${1:-}"
+  [ -n "$prev" ] && docker tag "$prev" buildbud-rollback:previous >/dev/null 2>&1
+  local before after
+  before="$(df -Pm / | awk 'NR==2{print $4}')"
+  docker image prune -f >/dev/null 2>&1 || true
+  after="$(df -Pm / | awk 'NR==2{print $4}')"
+  echo "reclaimed $(( after - before ))MB (kept one rollback image)"
+}
+
 bb_tree_tooling_files() {
   printf '%s\n' setup.sh bootstrap.sh docker-compose.yml Caddyfile harden.sh \
     PRE-ALPHA-ACCESS.md INSTALL-GUIDE.md README.md
