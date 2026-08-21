@@ -26,6 +26,32 @@ graph-api + app) on **your** infrastructure. Bring your own Claude auth: pass
 in the environment, or add it later in the app (Settings -> API Key Setup — it persists).
 Get an OAuth token with `claude setup-token`.
 
+## Signing in (and recovering the token)
+
+The installer prints a `BUILDBUD_API_TOKEN` at the end of the run. That token is
+the only way into a self-host instance — the Tailscale identity path needs a
+`tailscaled` socket, which a customer VPS does not have and the compose file
+does not mount, so it can never resolve there. Paste the token into the login
+dialog the app shows on first load, or send it as `Authorization: Bearer <tok>`.
+
+If you close that terminal, the token is still in the install's `.env`. Read it
+back with:
+
+```bash
+./setup.sh --show-token
+```
+
+Run it from the directory you installed into. It prints the token on stdout and
+nothing else, so it pipes cleanly:
+
+```bash
+curl -H "Authorization: Bearer $(./setup.sh --show-token)" https://your.host.example/api/health
+```
+
+If it reports the `.env` is missing you are in the wrong directory; if it
+reports the token is empty, the install predates token auth — re-run
+`./setup.sh --upgrade`.
+
 ## Revoking / going public later
 Access is revoked by removing you from the tailnet or the Gitea org. When BuildBud
 leaves pre-alpha, the image can be published publicly (ghcr) and this gating dropped.

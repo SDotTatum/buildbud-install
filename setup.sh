@@ -89,6 +89,31 @@ port_holders() {
   fi
 }
 
+# Print the instance's login credential, or explain why there isn't one.
+# The API token is the ONLY way into a self-host instance: the Tailscale
+# identity path needs a tailscaled socket that a customer VPS does not have and
+# this compose file does not mount, so it can never resolve there. Before
+# --show-token the credential was printed exactly once, at the end of the
+# install, and never again — closing that terminal locked the operator out of
+# their own instance (G61). Echoes the token on stdout and nothing else, so it
+# can be piped; every diagnosis goes to stderr.
+show_api_token() {
+  local env_file="$1" tok
+  if [ ! -f "$env_file" ]; then
+    echo "No install found: $env_file does not exist." >&2
+    echo "Run ./setup.sh first, or run this from the directory you installed into." >&2
+    return 1
+  fi
+  tok="$(grep -E '^BUILDBUD_API_TOKEN=' "$env_file" | head -1 | cut -d= -f2-)"
+  tok="${tok%\"}"; tok="${tok#\"}"
+  if [ -z "$tok" ]; then
+    echo "BUILDBUD_API_TOKEN is empty or absent in $env_file." >&2
+    echo "Re-run ./setup.sh --upgrade to regenerate it." >&2
+    return 1
+  fi
+  echo "$tok"
+}
+
 # Sourced by install/__tests__: define the helpers above, then stop. Nothing
 # below this line runs, so the tests cannot install anything.
 if [ -n "${BB_SETUP_LIB_ONLY:-}" ]; then return 0 2>/dev/null || exit 0; fi
@@ -100,6 +125,7 @@ UPGRADE=false
 RESET=false
 LICENSE_FILE=""
 INSTALL_DEPS=true
+SHOW_TOKEN=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -112,9 +138,21 @@ while [[ $# -gt 0 ]]; do
     --reset) RESET=true; shift ;;
     --no-install-deps) INSTALL_DEPS=false; shift ;;
     --no-starter-project) SEED_STARTER=false; shift ;;
+    --show-token) SHOW_TOKEN=true; shift ;;
     *) error "Unknown option: $1"; exit 1 ;;
   esac
 done
+
+# --show-token: reprint the login credential and exit. The API token is the
+# only way into a self-host instance (the Tailscale identity path needs a
+# tailscaled socket, which a customer VPS does not have and this compose file
+# does not mount), and before this flag it was printed exactly once, at the end
+# of the install, and never again. Closing that terminal locked the operator
+# out of their own instance with no documented way back in (G61).
+if [ "$SHOW_TOKEN" = true ]; then
+  show_api_token "$ENV_FILE" || exit 1
+  exit 0
+fi
 
 echo ""
 echo "  ╔══════════════════════════════════════╗"
@@ -684,6 +722,7 @@ else
 fi
 echo "  ║  Token: ${BUILDBUD_API_TOKEN}"
 echo "  ╠══════════════════════════════════════════════════════╣"
+echo "  ║  Lost the token? ./setup.sh --show-token              ║"
 echo "  ║  Manage:  docker compose logs -f                     ║"
 echo "  ║  Upgrade: ./setup.sh --upgrade                       ║"
 echo "  ║  Reset:   ./setup.sh --reset                         ║"
