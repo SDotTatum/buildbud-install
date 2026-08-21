@@ -5,6 +5,23 @@ set -euo pipefail
 # Usage: ./setup.sh [--domain your.domain.com] [--upgrade] [--reset] [--self-update]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Every compose invocation must go through this.
+#
+# `docker compose -f <file>` DISABLES the automatic pickup of
+# docker-compose.override.yml. Passing -f explicitly therefore silently drops
+# every local override -- and the override file is where an instance's
+# host-specific settings live. Measured on the bb-team instance 2026-08-21:
+# `setup.sh --upgrade` dropped an override that binds caddy to
+# 127.0.0.1:8085:80, so compose fell back to the shipped 80/443 bindings, and
+# caddy died with `failed to bind host port 0.0.0.0:443/tcp: address already in
+# use` because tailscaled Serve holds 443 on that host. The front door went down
+# and the upgrade aborted. The override existed precisely because of G60.
+bb_compose() {
+  local args=(-f "$SCRIPT_DIR/docker-compose.yml")
+  [ -f "$SCRIPT_DIR/docker-compose.override.yml" ] && args+=(-f "$SCRIPT_DIR/docker-compose.override.yml")
+  docker compose "${args[@]}" "$@"
+}
 ENABLE_ONECLICK="${ENABLE_ONECLICK:-false}"
 SEED_STARTER="${SEED_STARTER:-true}"
 SELF_UPDATE=false
@@ -301,7 +318,7 @@ seed_starter_project() {
   [ "$SEED_STARTER" = true ] || { info "Starter project seeding disabled (--no-starter-project)."; return 0; }
   info "Seeding starter project \"$STARTER_NAME\"..."
   local out
-  if ! out=$(docker compose -f "$SCRIPT_DIR/docker-compose.yml" exec -T \
+  if ! out=$(bb_compose exec -T \
       -e BB_SEED_NAME="$STARTER_NAME" buildbud node - <<'SEEDJS' 2>&1
 const NAME = process.env.BB_SEED_NAME || 'my-first-app';
 const TOKEN = process.env.BUILDBUD_API_TOKEN || '';
@@ -497,11 +514,11 @@ if $UPGRADE; then
   # when the orphan prune runs below.
   _prev_img="$(docker inspect buildbud-app --format '{{.Image}}' 2>/dev/null || true)"
 
-  docker compose -f "$SCRIPT_DIR/docker-compose.yml" pull buildbud
+  bb_compose pull buildbud
   # `up -d` over the whole stack, not just buildbud: a refreshed compose can
   # change any service definition, and compose only recreates what actually
   # differs, so unchanged services are left running.
-  docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d
+  bb_compose up -d
 
   # Confirm the upgrade before claiming it. This used to print "BuildBud
   # upgraded!" the instant `up -d` returned, which says only that compose
@@ -512,7 +529,7 @@ if $UPGRADE; then
   # exercise the unhealthy path at all.
   _up_ok=false
   for _ in $(seq 1 "${BB_UPGRADE_HEALTH_TRIES:-60}"); do
-    if docker compose -f "$SCRIPT_DIR/docker-compose.yml" exec -T buildbud \
+    if bb_compose exec -T buildbud \
          sh -lc 'wget -qO- http://localhost:3001/api/health >/dev/null 2>&1 || curl -sf http://localhost:3001/api/health >/dev/null 2>&1' 2>/dev/null; then
       _up_ok=true; break
     fi
@@ -540,7 +557,7 @@ if $RESET; then
   warn "This will delete ALL data and regenerate secrets. Continue? [y/N]"
   read -r confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
-  docker compose -f "$SCRIPT_DIR/docker-compose.yml" down -v 2>/dev/null || true
+  bb_compose down -v 2>/dev/null || true
   rm -f "$ENV_FILE"
   rm -rf "$SECRETS_DIR"
   info "Reset complete. Re-running setup..."
@@ -776,12 +793,12 @@ info "Starting BuildBud stack..."
 # (G39). Classify first, retry only what a retry can help. Daemon reachability
 # was already established in the prerequisite block.
 STACK_LOG="$(mktemp)"
-if ! docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d 2>&1 | tee "$STACK_LOG"; then
+if ! bb_compose up -d 2>&1 | tee "$STACK_LOG"; then
   case "$(classify_stack_error "$(cat "$STACK_LOG")")" in
     transient)
       warn "First stack start hit a transient error — retrying once..."
       sleep 3
-      docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d
+      bb_compose up -d
       ;;
     permission)
       error "Docker refused the connection: permission denied on the daemon socket."
@@ -810,11 +827,11 @@ rm -f "$STACK_LOG"
 info "Waiting for Postgres to be healthy..."
 MAX_WAIT=60
 WAITED=0
-until docker compose -f "$SCRIPT_DIR/docker-compose.yml" exec -T postgres pg_isready -U postgres -d buildbud &>/dev/null; do
+until bb_compose exec -T postgres pg_isready -U postgres -d buildbud &>/dev/null; do
   WAITED=$((WAITED + 2))
   if [[ $WAITED -ge $MAX_WAIT ]]; then
     error "Postgres did not become healthy in ${MAX_WAIT}s."
-    docker compose -f "$SCRIPT_DIR/docker-compose.yml" logs postgres
+    bb_compose logs postgres
     exit 1
   fi
   sleep 2
@@ -824,7 +841,7 @@ success "Postgres is healthy"
 # ─── Wait for the app (green DB != working app) ───────────────────────────────
 info "Waiting for the BuildBud app to answer /api/health..."
 APP_WAIT=0
-until docker compose -f "$SCRIPT_DIR/docker-compose.yml" exec -T buildbud sh -lc 'wget -qO- http://localhost:3001/api/health >/dev/null 2>&1 || curl -sf http://localhost:3001/api/health >/dev/null 2>&1' &>/dev/null; do
+until bb_compose exec -T buildbud sh -lc 'wget -qO- http://localhost:3001/api/health >/dev/null 2>&1 || curl -sf http://localhost:3001/api/health >/dev/null 2>&1' &>/dev/null; do
   APP_WAIT=$((APP_WAIT + 3))
   if [[ $APP_WAIT -ge 90 ]]; then
     warn "App did not answer /api/health in 90s. Check: docker compose logs buildbud"
@@ -882,7 +899,7 @@ if ! entry_ok "$ENTRY_CODE"; then
   else
     error "  http://127.0.0.1:3001/api/health -> ${_direct}  (the app is not answering either)"
   fi
-  _pub="$(docker compose -f "$SCRIPT_DIR/docker-compose.yml" port caddy 80 2>/dev/null || true)"
+  _pub="$(bb_compose port caddy 80 2>/dev/null || true)"
   if [ -z "$_pub" ]; then
     error "  caddy publishes no host port — something else already holds :80/:443."
     for _p in 80 443; do
