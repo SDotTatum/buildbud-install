@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # BuildBud Self-Hosted Setup
-# Usage: ./setup.sh [--domain your.domain.com] [--upgrade] [--reset] [--self-update]
+# Usage: ./setup.sh [--domain your.domain.com] [--license bundle.json] [--upgrade]
+#                   [--reset] [--self-update] [--renew-license] [--no-auto-renew]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -197,6 +198,204 @@ bb_tree_missing_flags() {
   comm -23 <(printf '%s\n' "$up") <(printf '%s\n' "$loc")
 }
 
+# ─── License renewal ──────────────────────────────────────────────────────────
+# A license is minted with a short TTL (30d) on the premise that it renews. That
+# renewal never existed, so every instance became permanently un-upgradable 30
+# days after install -- surfacing only as a raw Docker 401 on `compose pull`.
+#
+# This lives host-side and not in the app because the container cannot do any of
+# it: docker-compose.yml does not mount the license, and the app has no docker
+# socket, so it can neither read the bundle nor refresh the registry credential.
+
+BB_LICENSE_RENEW_URL="${BB_LICENSE_RENEW_URL:-https://hub.cutclouds.com/renew}"
+BB_RENEW_WINDOW_DAYS="${BB_RENEW_WINDOW_DAYS:-7}"
+
+bb_license_path() { echo "${BB_LICENSE_PATH_HOST:-$HOME/.buildbud/license.json}"; }
+bb_hub_pubkey()   { echo "${BB_HUB_PUBKEY_PATH:-$HOME/.buildbud/hub-signing.pub}"; }
+
+# Field from a bundle file. Empty string (not an error) when absent, so callers
+# can distinguish "missing" from "unparseable" themselves.
+bb_license_field() {
+  python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get(sys.argv[2],"") or "")
+except Exception: sys.exit(1)' "$1" "$2" 2>/dev/null
+}
+
+# Milliseconds until expiry, or "" if unknown. The hub mints iat/exp in
+# MILLISECONDS; comparing those against a seconds epoch reads as "not expired"
+# and silently disables the whole renewal path.
+bb_license_ms_left() {
+  python3 -c 'import json,sys,time
+try:
+    e=json.load(open(sys.argv[1]))["exp"]
+except Exception: sys.exit(1)
+if not isinstance(e,(int,float)): sys.exit(1)
+if e < 1e11: e*=1000          # seconds -> ms
+print(int(e - time.time()*1000))' "$1" 2>/dev/null
+}
+
+# Verify a bundle's Ed25519 signature against the PINNED hub key, then check the
+# payload. A valid signature over the wrong payload is still an attack.
+#
+# Signature verification against the pinned key subsumes a kid comparison, so
+# there is no separate kid check: if it verifies, it was signed by that key.
+#
+# openssl is a hard prerequisite already (setup.sh generates an ed25519 keypair
+# during install), so this adds no dependency.
+#
+# `-rawin` REFUSES non-seekable input -- stdin, pipes and <(...) all fail with
+# "unable to determine file size for oneshot operation". Body and signature must
+# be real files. Do not "simplify" this into a pipeline, and never add
+# `|| true` / `2>/dev/null` to the verify itself: that converts the gate into
+# one that always passes, which is worse than having no gate.
+bb_verify_license_bundle() {
+  local bundle="$1" expect_iid="${2:-}" min_exp_ms="${3:-}"
+  local pub; pub="$(bb_hub_pubkey)"
+  [ -f "$pub" ]    || { error "Hub public key not found at $pub — cannot verify a renewed license."; return 1; }
+  [ -f "$bundle" ] || { error "Bundle not found: $bundle"; return 1; }
+
+  local tok; tok="$(bb_license_field "$bundle" license)" || { error "Bundle has no 'license' field."; return 1; }
+  [ -n "$tok" ] || { error "Bundle has no 'license' field."; return 1; }
+
+  local tmp; tmp="$(mktemp -d)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+  ( umask 077
+    python3 -c 'import sys,base64
+tok=sys.argv[1]; d=sys.argv[2]
+parts=tok.split(".")
+if len(parts)!=2: sys.exit(1)
+body,sig=parts
+open(d+"/body","w").write(body)                       # signed bytes are the b64url TEXT
+pad=lambda x: x + "="*(-len(x)%4)
+open(d+"/sig","wb").write(base64.urlsafe_b64decode(pad(sig)))
+open(d+"/payload","wb").write(base64.urlsafe_b64decode(pad(body)))' "$tok" "$tmp" ) \
+    || { error "Malformed license token in bundle."; return 1; }
+
+  openssl pkeyutl -verify -pubin -inkey "$pub" -rawin -in "$tmp/body" -sigfile "$tmp/sig" >/dev/null 2>&1 \
+    || { error "License signature INVALID — refusing to install it."; return 1; }
+
+  python3 -c 'import json,sys
+p=json.load(open(sys.argv[1]+"/payload"))
+want_iid, min_exp = sys.argv[2], sys.argv[3]
+if p.get("typ")!="license": print("not a license token",file=sys.stderr); sys.exit(1)
+if want_iid and p.get("iid")!=want_iid:
+    print("instanceId mismatch: got %s want %s"%(p.get("iid"),want_iid),file=sys.stderr); sys.exit(1)
+e=p.get("exp",0)
+if e < 1e11: e*=1000
+if min_exp and e <= int(min_exp):
+    print("expiry did not advance — replay of an older bundle",file=sys.stderr); sys.exit(1)' \
+    "$tmp" "$expect_iid" "${min_exp_ms:-}" \
+    || { error "License payload rejected."; return 1; }
+  return 0
+}
+
+# {instanceId, reportToken, exp, tier} for the container.
+#
+# Deliberately NOT the whole bundle: pullToken is a registry credential the app
+# has no use for (no docker socket), so mounting it would widen exposure for
+# nothing. The shape still satisfies feedback-reporter's file-first branch, so a
+# renewed reportToken reaches a RUNNING container with no recreate.
+#
+# 0644 inside the 0700 secrets dir: the container runs as uid 1001 and only
+# reads 0600 files today by coincidence of the installing user's uid.
+bb_write_license_status() {
+  local bundle="$1" out="$SECRETS_DIR/license-container.json"
+  mkdir -p "$SECRETS_DIR"
+  python3 -c 'import json,sys
+b=json.load(open(sys.argv[1]))
+out={k:b.get(k) for k in ("instanceId","reportToken","exp","tier","channel")}
+open(sys.argv[2],"w").write(json.dumps(out,indent=2)+"\n")' "$bundle" "$out" || return 1
+  chmod 644 "$out"
+}
+
+# Install a verified bundle: in-place rewrite, env re-extract, status file, login.
+#
+# IN PLACE, never mv/rename. A bind-mounted single file follows the INODE, so an
+# atomic rename leaves the container reading the old content forever.
+bb_apply_license_bundle() {
+  local new="$1" lic; lic="$(bb_license_path)"
+  mkdir -p "$(dirname "$lic")" && chmod 700 "$(dirname "$lic")"
+  [ -f "$lic" ] && cp -a "$lic" "$lic.prev"
+  ( umask 077; cat "$new" > "$lic" )
+  chmod 600 "$lic"
+
+  local rt iid
+  rt="$(bb_license_field "$lic" reportToken || true)"
+  iid="$(bb_license_field "$lic" instanceId || true)"
+  if [ -f "$ENV_FILE" ]; then
+    sed -i '/^BB_REPORT_TOKEN=/d;/^BB_INSTANCE_ID=/d' "$ENV_FILE"   # replace, never append
+    { echo "BB_REPORT_TOKEN=$rt"; echo "BB_INSTANCE_ID=$iid"; } >> "$ENV_FILE"
+  fi
+  bb_write_license_status "$lic" || warn "Could not write the container license status file."
+
+  bb_license_field "$lic" pullToken \
+    | docker login "${REG_HOST:-${BB_REGISTRY_HOST:-hub.cutclouds.com}}" -u license --password-stdin >/dev/null 2>&1 \
+    || { error "Registry login failed with the new license."; return 1; }
+  return 0
+}
+
+# Renew if the license is inside the window (or already expired). Returns 0 when
+# nothing needed doing, so it is safe to call on every upgrade.
+bb_renew_license() {
+  local force="${1:-false}" lic; lic="$(bb_license_path)"
+  if [ ! -f "$lic" ]; then
+    error "No license at $lic. Run: ./setup.sh --license /path/to/license.json"
+    return 1
+  fi
+
+  local ms_left; ms_left="$(bb_license_ms_left "$lic" || true)"
+  if [ -z "$ms_left" ]; then
+    # LOUD, and it means ATTEMPT. Defaulting an unreadable expiry to "skip"
+    # would disable renewal permanently and silently -- the exact failure this
+    # whole change exists to remove.
+    warn "Could not read an expiry from $lic — attempting renewal anyway."
+  elif [ "$force" != true ] && [ "$ms_left" -gt $(( BB_RENEW_WINDOW_DAYS * 86400000 )) ]; then
+    info "License valid for $(( ms_left / 86400000 )) more days — no renewal needed."
+    return 0
+  fi
+
+  local iid cur_exp
+  iid="$(bb_license_field "$lic" instanceId || true)"
+  cur_exp="$(python3 -c 'import json,sys
+e=json.load(open(sys.argv[1])).get("exp",0)
+print(int(e*1000 if e<1e11 else e))' "$lic" 2>/dev/null || echo 0)"
+
+  info "Renewing license (instance ${iid:-unknown})..."
+  local tmp; tmp="$(mktemp -d)"; trap "rm -rf '$tmp'" RETURN
+  local code
+  code="$( ( umask 077; curl -s -o "$tmp/resp.json" -w '%{http_code}' --max-time 30 \
+            -X POST "$BB_LICENSE_RENEW_URL" -H 'content-type: application/json' \
+            --data-binary "$(python3 -c 'import json,sys
+print(json.dumps({"license": json.load(open(sys.argv[1]))["license"]}))' "$lic")" ) 2>/dev/null || echo 000 )"
+
+  if [ "$code" != "200" ]; then
+    error "License renewal failed (HTTP $code)."
+    python3 -c 'import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    if d.get("error"):  print("  reason: %s"%d["error"],file=sys.stderr)
+    if d.get("remedy"): print("  remedy: %s"%d["remedy"],file=sys.stderr)
+except Exception: pass' "$tmp/resp.json" 2>/dev/null || true
+    return 1
+  fi
+
+  python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+b=d.get("license") if isinstance(d.get("license"),dict) else d
+json.dump(b, open(sys.argv[2],"w"), indent=2)' "$tmp/resp.json" "$tmp/bundle.json" \
+    || { error "Renewal response was not a license bundle."; return 1; }
+
+  # Verify BEFORE writing. Installing an unverified bundle is strictly worse
+  # than not renewing at all.
+  bb_verify_license_bundle "$tmp/bundle.json" "$iid" "$cur_exp" || return 1
+  bb_apply_license_bundle "$tmp/bundle.json" || return 1
+
+  local left; left="$(bb_license_ms_left "$(bb_license_path)" || echo 0)"
+  success "License renewed — valid for $(( left / 86400000 )) days."
+  return 0
+}
+
 # Sourced by install/__tests__: define the helpers above, then stop. Nothing
 # below this line runs, so the tests cannot install anything.
 if [ -n "${BB_SETUP_LIB_ONLY:-}" ]; then return 0 2>/dev/null || exit 0; fi
@@ -209,6 +408,8 @@ RESET=false
 LICENSE_FILE=""
 INSTALL_DEPS=true
 SHOW_TOKEN=false
+RENEW_ONLY=false
+AUTO_RENEW=true
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -223,6 +424,8 @@ while [[ $# -gt 0 ]]; do
     --no-starter-project) SEED_STARTER=false; shift ;;
     --show-token) SHOW_TOKEN=true; shift ;;
     --self-update) SELF_UPDATE=true; shift ;;
+    --renew-license) RENEW_ONLY=true; shift ;;
+    --no-auto-renew) AUTO_RENEW=false; shift ;;
     *) error "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -380,6 +583,51 @@ SEEDJS
   esac
 }
 
+# Daily license renewal timer. Installed BY DEFAULT (--no-auto-renew opts out),
+# unlike the one-click updater: this needs no privileged docker access, and an
+# opt-in renewal would have saved neither existing instance from the 30-day
+# cliff. A short TTL is only a sound security property if renewal is automatic.
+#
+# User= and HOME= are pinned to the INSTALLING user, not root. A root-run timer
+# would renew into /root/.buildbud and /root/.docker/config.json while the
+# operator's own `docker compose pull` kept failing -- renewal "succeeds" and
+# nothing improves.
+install_renew_timer() {
+  local u; u="$(id -un)"
+  info "Installing daily license renewal timer (user $u)..."
+  _priv tee /etc/systemd/system/buildbud-license-renew.service >/dev/null <<UNIT
+[Unit]
+Description=BuildBud license renewal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=${u}
+Environment=HOME=${HOME}
+WorkingDirectory=${SCRIPT_DIR}
+ExecStart=/bin/bash ${SCRIPT_DIR}/setup.sh --renew-license
+UNIT
+  # RandomizedDelaySec: without it every instance in the fleet hits the hub at
+  # the same minute.
+  _priv tee /etc/systemd/system/buildbud-license-renew.timer >/dev/null <<'UNIT'
+[Unit]
+Description=BuildBud daily license renewal
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  _priv systemctl daemon-reload
+  _priv systemctl enable --now buildbud-license-renew.timer >/dev/null 2>&1 \
+    && success "License renewal timer active (daily)." \
+    || warn "Could not enable the renewal timer — renew manually with ./setup.sh --renew-license"
+}
+
 install_host_updater() {
   local CTRL="${BB_CONTROL_DIR:-/var/lib/buildbud/update-control}"
   info "Installing one-click host updater (privileged, opt-in)..."
@@ -479,6 +727,15 @@ esac
 success "Prerequisites OK"
 
 # ─── Upgrade path ─────────────────────────────────────────────────────────────
+# ─── Renew-license path ───────────────────────────────────────────────────────
+# Explicit manual renewal. Also the documented recovery for an instance whose
+# license already lapsed:
+#   ./setup.sh --self-update && ./setup.sh --renew-license && ./setup.sh --upgrade
+if $RENEW_ONLY; then
+  bb_renew_license true || exit 1
+  exit 0
+fi
+
 if $UPGRADE; then
   info "Upgrading BuildBud..."
 
@@ -514,7 +771,68 @@ if $UPGRADE; then
   # when the orphan prune runs below.
   _prev_img="$(docker inspect buildbud-app --format '{{.Image}}' 2>/dev/null || true)"
 
-  bb_compose pull buildbud
+  # Top up the license BEFORE pulling. The registry credential is minted from it
+  # and was previously only ever refreshed at install time, so a 30-day-old
+  # instance failed here with a bare Docker 401 that named neither the license
+  # nor the remedy.
+  if [ "$AUTO_RENEW" = true ]; then
+    bb_renew_license || warn "Continuing with the existing license."
+  fi
+
+  # Capture the pull rather than letting it die under `set -e` with raw output.
+  # A 401 here is almost always licensing, and Docker's own message says nothing
+  # about that.
+  _pull_log="$(mktemp)"
+  if ! bb_compose pull buildbud >"$_pull_log" 2>&1; then
+    cat "$_pull_log"
+    if grep -qiE '401|unauthorized|authentication required' "$_pull_log"; then
+      _lic="$(bb_license_path)"
+      if [ ! -f "$_lic" ]; then
+        error "Registry refused the pull and there is no license at $_lic."
+        error "Run: ./setup.sh --license /path/to/license.json"
+        rm -f "$_pull_log"; exit 1
+      fi
+      _left="$(bb_license_ms_left "$_lic" || true)"
+      if [ -n "$_left" ] && [ "$_left" -le 0 ]; then
+        error "Your license EXPIRED $(( -_left / 86400000 )) day(s) ago — that is why the pull was refused."
+      else
+        error "The registry refused the pull (401). Re-checking your license."
+      fi
+      info "Attempting renewal, then one retry..."
+      if bb_renew_license true && bb_compose pull buildbud; then
+        success "License renewed and the image pulled."
+      else
+        error "Could not renew automatically."
+        error "Sign in at https://cutclouds.com to download a fresh license, then:"
+        error "  ./setup.sh --license /path/to/license.json"
+        rm -f "$_pull_log"; exit 1
+      fi
+    else
+      error "Image pull failed — see the output above."
+      rm -f "$_pull_log"; exit 1
+    fi
+  fi
+  rm -f "$_pull_log"
+
+  # Refresh the container-visible license status on EVERY upgrade. Two reasons:
+  # the app shows expiry from it, and if the mount source does not exist when
+  # `up -d` runs Docker silently creates a DIRECTORY there instead.
+  [ -f "$(bb_license_path)" ] && bb_write_license_status "$(bb_license_path)" || true
+
+  # G104: the fresh-install path writes secrets/hub-signing.pub at a line that
+  # sits AFTER this block's `exit 0`, while the comment there claims it runs on
+  # every run "(incl. --upgrade)". It does not, so an upgrade-only instance
+  # never received the mount source, Docker auto-created a DIRECTORY in its
+  # place, and update-checker silently verified nothing.
+  mkdir -p "$SECRETS_DIR"
+  if [ -f "$HOME/.buildbud/hub-signing.pub" ] && [ ! -f "$SECRETS_DIR/hub-signing.pub" ]; then
+    if [ -d "$SECRETS_DIR/hub-signing.pub" ]; then
+      warn "secrets/hub-signing.pub is a DIRECTORY (Docker auto-created it) — replacing with the real key."
+      rmdir "$SECRETS_DIR/hub-signing.pub" 2>/dev/null || rm -rf "$SECRETS_DIR/hub-signing.pub"
+    fi
+    cp "$HOME/.buildbud/hub-signing.pub" "$SECRETS_DIR/hub-signing.pub" && chmod 644 "$SECRETS_DIR/hub-signing.pub"
+    info "Restored secrets/hub-signing.pub (update verification was inert without it)."
+  fi
   # `up -d` over the whole stack, not just buildbud: a refreshed compose can
   # change any service definition, and compose only recreates what actually
   # differs, so unchanged services are left running.
@@ -549,6 +867,7 @@ if $UPGRADE; then
   fi
 
   [ "$ENABLE_ONECLICK" = true ] && install_host_updater
+  [ "$AUTO_RENEW" = true ] && install_renew_timer || true
   exit 0
 fi
 
@@ -779,6 +1098,14 @@ chmod 644 "$HOME/.buildbud/hub-signing.pub"
 # Written on every run (incl. --upgrade) so pre-existing installs get the mount source.
 cp "$HOME/.buildbud/hub-signing.pub" "$SECRETS_DIR/hub-signing.pub" && chmod 644 "$SECRETS_DIR/hub-signing.pub"
 
+# Container-visible license state ({instanceId, reportToken, exp, tier}); NOT the
+# whole bundle -- see bb_write_license_status. Must exist BEFORE any `up -d`:
+# if the bind-mount source is missing Docker silently creates a DIRECTORY there
+# and the container sees a directory forever.
+if [ -f "$HOME/.buildbud/license.json" ]; then
+  bb_write_license_status "$HOME/.buildbud/license.json" || warn "Could not write the container license status file."
+fi
+
 echo "$PULL_TOKEN" | docker login "$REG_HOST" -u license --password-stdin \
   || { error "Registry login failed. Your license may be expired or revoked — contact the maintainer."; exit 1; }
 success "License accepted — registry access granted"
@@ -928,4 +1255,5 @@ info "Optional: harden this VPS (SSH + fail2ban + firewall):"
 info "  sudo ./harden.sh            # dry-run preview"
 info "  sudo ./harden.sh --apply    # apply (keep a 2nd session open!)"
 [ "$ENABLE_ONECLICK" = true ] && install_host_updater
+[ "$AUTO_RENEW" = true ] && install_renew_timer || true
 success "Setup complete!"

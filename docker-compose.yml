@@ -237,6 +237,11 @@ services:
       BB_REPORT_TOKEN: "${BB_REPORT_TOKEN:-}"
       BB_INSTANCE_ID: "${BB_INSTANCE_ID:-}"
       BB_HUB_PUBKEY_PATH: "/secrets/hub-signing.pub"
+      # Container-visible license state. Written by setup.sh on install AND upgrade.
+      # feedback-reporter prefers this file over BB_REPORT_TOKEN, so a renewed
+      # report token reaches a RUNNING container without a recreate -- an env var
+      # would stay pinned to whatever the container started with.
+      BB_LICENSE_PATH: "/secrets/license-container.json"
     volumes:
       - app_data:/app/data
       - ${BB_CONTROL_DIR:-/var/lib/buildbud/update-control}:/app/.update-control
@@ -244,6 +249,7 @@ services:
       - ./secrets/dispatch-signing.pem:/secrets/dispatch-signing.pem:ro
       - ./secrets/dispatch-signing.pub:/secrets/dispatch-signing.pub:ro
       - ./secrets/hub-signing.pub:/secrets/hub-signing.pub:ro
+      - ./secrets/license-container.json:/secrets/license-container.json:ro
     depends_on:
       postgres:
         condition: service_healthy
