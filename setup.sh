@@ -948,9 +948,22 @@ BUILDBUD_API_TOKEN="$(_keep BUILDBUD_API_TOKEN)"; BUILDBUD_API_TOKEN="${BUILDBUD
 BB_VERIFY_SERVICE_TOKEN="$(_keep BB_VERIFY_SERVICE_TOKEN)"; BB_VERIFY_SERVICE_TOKEN="${BB_VERIFY_SERVICE_TOKEN:-$(openssl rand -hex 24)}"
 BB_GRAPH_API_TOKEN="$(_keep BB_GRAPH_API_TOKEN)"; BB_GRAPH_API_TOKEN="${BB_GRAPH_API_TOKEN:-$(openssl rand -hex 24)}"
 
-# Ed25519 dispatch signing keypair
-openssl genpkey -algorithm ed25519 -out "$SECRETS_DIR/dispatch-signing.pem" 2>/dev/null
-openssl pkey -in "$SECRETS_DIR/dispatch-signing.pem" -pubout -out "$SECRETS_DIR/dispatch-signing.pub" 2>/dev/null
+# Ed25519 dispatch signing keypair.
+#
+# G105: this was regenerated unconditionally on every non-upgrade run, unlike
+# every secret above it, which goes through _keep. It is the instance's signing
+# IDENTITY, so rotating it silently invalidates every dispatch signature already
+# issued and forecloses using the keypair for proof-of-possession renewal auth.
+# _keep itself does not apply here because this is a file, not an .env value, so
+# the equivalent guard is the file's own existence.
+if [ ! -s "$SECRETS_DIR/dispatch-signing.pem" ]; then
+  openssl genpkey -algorithm ed25519 -out "$SECRETS_DIR/dispatch-signing.pem" 2>/dev/null
+  openssl pkey -in "$SECRETS_DIR/dispatch-signing.pem" -pubout -out "$SECRETS_DIR/dispatch-signing.pub" 2>/dev/null
+elif [ ! -s "$SECRETS_DIR/dispatch-signing.pub" ]; then
+  # Preserve the identity but repair a missing public half rather than leaving
+  # the pair unusable: a guard that only stops writing can strand broken state.
+  openssl pkey -in "$SECRETS_DIR/dispatch-signing.pem" -pubout -out "$SECRETS_DIR/dispatch-signing.pub" 2>/dev/null
+fi
 chmod 600 "$SECRETS_DIR/dispatch-signing.pem"
 chmod 644 "$SECRETS_DIR/dispatch-signing.pub"
 
