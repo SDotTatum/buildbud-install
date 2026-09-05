@@ -1119,8 +1119,32 @@ if [ -f "$HOME/.buildbud/license.json" ]; then
   bb_write_license_status "$HOME/.buildbud/license.json" || warn "Could not write the container license status file."
 fi
 
+# G100: this is the day-zero failure an expired instance actually hits, so the
+# recovery has to be HERE. It used to say "contact the maintainer", while the
+# working recovery sat in a comment at the top of the renew path -- readable by
+# whoever edits this file, invisible to whoever is stranded by it.
+#
+# Why --self-update comes first: --upgrade is the thing that breaks at day 30,
+# so an already-expired instance cannot repair itself with it. --self-update is
+# license-independent (public tarball), which is what makes it the entry point.
 echo "$PULL_TOKEN" | docker login "$REG_HOST" -u license --password-stdin \
-  || { error "Registry login failed. Your license may be expired or revoked — contact the maintainer."; exit 1; }
+  || {
+       error "Registry login failed — your license is expired or revoked."
+       echo "" >&2
+       echo "  Recover an expired instance by running, in this directory:" >&2
+       echo "" >&2
+       echo "      ./setup.sh --self-update && ./setup.sh --renew-license && ./setup.sh --upgrade" >&2
+       echo "" >&2
+       echo "  Run them in that order: --upgrade is what stops working when a" >&2
+       echo "  license lapses, so it cannot be the first step. --self-update needs" >&2
+       echo "  no license and refreshes this script and the compose file first." >&2
+       echo "" >&2
+       echo "  If --self-update is not recognised, this install predates it." >&2
+       echo "  Re-bootstrap from your account page at https://cutclouds.com" >&2
+       echo "  and the installer will bring the instance back with its data." >&2
+       echo "" >&2
+       exit 1
+     }
 success "License accepted — registry access granted"
 
 # ─── Start stack ──────────────────────────────────────────────────────────────
