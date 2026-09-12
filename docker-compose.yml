@@ -11,6 +11,7 @@ services:
   # Postgres — Primary database
   # ============================================
   postgres:
+    init: true
     image: postgres:16-alpine
     container_name: buildbud-postgres
     environment:
@@ -32,6 +33,7 @@ services:
   # (drop-in replacement for Supabase REST API)
   # ============================================
   postgrest:
+    init: true
     image: postgrest/postgrest:v12.2.3
     container_name: buildbud-postgrest
     environment:
@@ -52,6 +54,7 @@ services:
   # /rest/v1 paths resolve against the bare self-host PostgREST.
   # ============================================
   supabase-rest:
+    init: true
     image: caddy:2-alpine
     container_name: buildbud-supabase-rest
     configs:
@@ -66,6 +69,7 @@ services:
   # FalkorDB — Graph knowledge store
   # ============================================
   falkordb:
+    init: true
     image: falkordb/falkordb:latest
     container_name: buildbud-falkordb
     command: ["--save", "900", "1"]
@@ -94,6 +98,7 @@ services:
   # NATS — Message bus with JetStream
   # ============================================
   nats:
+    init: true
     image: nats:2.10-alpine
     container_name: buildbud-nats
     command:
@@ -116,6 +121,7 @@ services:
   # Reuses the app image; serves the knowledge-graph/Insights UI read path.
   # ============================================
   graph-api:
+    init: true
     image: ${REGISTRY:-hub.cutclouds.com}/buildbud:${VERSION:-latest}
     # Optional sidecar (memory-graph read API for Insights).
     # CORRECTION 2026-08-03: scripts/graph_api.py IS in the release image (gap
@@ -149,6 +155,7 @@ services:
   # stays browser-free. GET /verify?url=... -> {pass, renderedChars, failures}
   # ============================================
   bb-verify:
+    init: true
     image: ${REGISTRY:-hub.cutclouds.com}/bb-verify:${VERSION:-latest}
     container_name: buildbud-bb-verify
     # Optional sidecar (in-product verification). Image not yet in the license
@@ -173,6 +180,7 @@ services:
   # BuildBud — Application
   # ============================================
   buildbud:
+    init: true
     image: ${REGISTRY:-hub.cutclouds.com}/buildbud:${VERSION:-latest}
     container_name: buildbud-app
     environment:
@@ -267,6 +275,7 @@ services:
   # Caddy — TLS termination and reverse proxy
   # ============================================
   caddy:
+    init: true
     image: caddy:2-alpine
     container_name: buildbud-caddy
     ports:

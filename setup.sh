@@ -1253,6 +1253,23 @@ echo "  ║  Manage:  docker compose logs -f                     ║"
 echo "  ║  Upgrade: ./setup.sh --upgrade                       ║"
 echo "  ║  Reset:   ./setup.sh --reset                         ║"
 echo "  ╚══════════════════════════════════════════════════════╝"
+
+# A token minted for a host that already served BuildBud will collide with the
+# browser credential saved for that origin. Observed: a fresh install onto a
+# reused domain rejected its own valid token at the login form, because Chrome
+# filled the PREVIOUS install's token into the password field. The server said
+# only "invalid_token", so the operator had no way to see what happened.
+#
+# Only for a first install: an --upgrade keeps the same token, so there is
+# nothing to collide with.
+if [ "${UPGRADE:-false}" != "true" ]; then
+  echo ""
+  echo -e "${BLUE}[BuildBud]${NC} This host may have served an earlier BuildBud install."
+  echo -e "${BLUE}[BuildBud]${NC}   The token above is NEW. A browser that saved the old one for"
+  echo -e "${BLUE}[BuildBud]${NC}   this address will autofill it and the login will be refused."
+  echo -e "${BLUE}[BuildBud]${NC}   If that happens: clear the field and paste the token above, or"
+  echo -e "${BLUE}[BuildBud]${NC}   open the URL in a private window."
+fi
 echo ""
 if ! entry_ok "$ENTRY_CODE"; then
   error "${ENTRY_URL} did not answer (curl status ${ENTRY_CODE}). The stack is up but"
