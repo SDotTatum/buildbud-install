@@ -193,6 +193,11 @@ services:
       CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost,https://localhost}"
       ENABLE_AUTH: "true"
       BUILDBUD_API_TOKEN: "${BUILDBUD_API_TOKEN}"
+      # Names the project owner on an install with no user accounts. Written to
+      # .env by setup.sh; without this line it would sit there unread, and
+      # project creation would keep refusing -- the same "written where nothing
+      # looks" shape as G170 and G177.
+      BUILDBUD_OWNER_USER_ID: "${BUILDBUD_OWNER_USER_ID}"
       # Claude auth — BYO: bring your own token (claude setup-token) or API key.
       # At least one is required or agents cannot authenticate.
       CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"

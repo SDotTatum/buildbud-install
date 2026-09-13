@@ -948,6 +948,28 @@ BUILDBUD_API_TOKEN="$(_keep BUILDBUD_API_TOKEN)"; BUILDBUD_API_TOKEN="${BUILDBUD
 BB_VERIFY_SERVICE_TOKEN="$(_keep BB_VERIFY_SERVICE_TOKEN)"; BB_VERIFY_SERVICE_TOKEN="${BB_VERIFY_SERVICE_TOKEN:-$(openssl rand -hex 24)}"
 BB_GRAPH_API_TOKEN="$(_keep BB_GRAPH_API_TOKEN)"; BB_GRAPH_API_TOKEN="${BB_GRAPH_API_TOKEN:-$(openssl rand -hex 24)}"
 
+# Who owns the projects on this install.
+#
+# A self-host instance authenticates with BUILDBUD_API_TOKEN and has no user
+# accounts -- `select count(*) from users` is 0. Project creation refuses
+# without an owner ("an authenticated user is required to create a project"),
+# because a project with no owner is not a lax project, it is an unreachable
+# one. So the wizard could interview, produce a brief, and then fail at the
+# final step on every self-host install.
+#
+# The server already supports being TOLD who the owner is
+# (lib/owner-identity.ts case 1); nothing was telling it. This names the owner
+# explicitly rather than having the server invent an identity at runtime, which
+# is the behaviour that module exists to refuse.
+#
+# owner_id carries no foreign key to users, so this does not require an account.
+# Preserved across upgrades by _keep: regenerating it would orphan every project
+# the instance already owns.
+BUILDBUD_OWNER_USER_ID="$(_keep BUILDBUD_OWNER_USER_ID)"
+if [[ -z "$BUILDBUD_OWNER_USER_ID" ]]; then
+  BUILDBUD_OWNER_USER_ID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)"
+fi
+
 # Ed25519 dispatch signing keypair.
 #
 # G105: this was regenerated unconditionally on every non-upgrade run, unlike
@@ -1031,6 +1053,7 @@ JWT_SECRET=${JWT_SECRET}
 CREDENTIALS_ENCRYPTION_KEY=${CREDENTIALS_ENCRYPTION_KEY}
 FALKORDB_PASSWORD=${FALKORDB_PASSWORD}
 BUILDBUD_API_TOKEN=${BUILDBUD_API_TOKEN}
+BUILDBUD_OWNER_USER_ID=${BUILDBUD_OWNER_USER_ID}
 BB_VERIFY_SERVICE_TOKEN=${BB_VERIFY_SERVICE_TOKEN}
 BB_GRAPH_API_TOKEN=${BB_GRAPH_API_TOKEN}
 

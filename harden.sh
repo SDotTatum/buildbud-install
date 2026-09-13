@@ -45,6 +45,25 @@ if [[ ! -s "$AUTH_KEYS" ]]; then
 fi
 ok "Lock-out guard passed: '$ADMIN_USER' has authorized_keys."
 
+# `PermitRootLogin no` locks out the very account being hardened when that
+# account IS root -- which is the default on a fresh self-host box, and is
+# printed back by this script as "admin user: root".
+#
+# This happened: the guard above passed (root did have authorized_keys), the
+# config was written, sshd validated and reloaded cleanly, and every existing
+# session kept working. The next login attempt got "Too many authentication
+# failures" and the box was reachable only through the one terminal still open.
+#
+# Having keys is not the same as being allowed to use them. prohibit-password
+# keeps the actual security property -- no password logins, ever -- while
+# leaving key auth for the admin intact.
+if [[ "$ADMIN_USER" == "root" ]]; then
+  ROOT_LOGIN="prohibit-password"
+  info "  admin user is root -> PermitRootLogin=prohibit-password (keys yes, passwords no)"
+else
+  ROOT_LOGIN="no"
+fi
+
 run(){ if $APPLY; then eval "$1"; else echo "    would run: $1"; fi; }
 
 # ── 1. SSH hardening (drop-in, validated before reload) ───────────────────────
@@ -53,23 +72,46 @@ DROP="/etc/ssh/sshd_config.d/99-buildbud-harden.conf"
 read -r -d '' SSHD_CONF <<EOF || true
 # Managed by BuildBud harden.sh — do not edit by hand.
 Port ${SSH_PORT}
-PermitRootLogin no
+PermitRootLogin ${ROOT_LOGIN}
 PasswordAuthentication no
 PubkeyAuthentication yes
 ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
 AllowUsers ${ADMIN_USER}
 X11Forwarding no
-MaxAuthTries 3
+MaxAuthTries 6
 LoginGraceTime 30
 EOF
 if $APPLY; then
   cp -a /etc/ssh/sshd_config "/etc/ssh/sshd_config.buildbud-backup.$(date +%s)" 2>/dev/null || true
   printf '%s\n' "$SSHD_CONF" > "$DROP"
   if sshd -t; then
+    # `sshd -t` only says the file PARSES. It does not say the result lets the
+    # admin in, and that distinction is the whole bug: the config that locked
+    # root out validated perfectly and reloaded without complaint.
+    #
+    # -T -C resolves the EFFECTIVE policy for this specific user, Match blocks
+    # included, so this asks the question that actually matters.
+    EFF="$(sshd -T -C "user=${ADMIN_USER},host=localhost,addr=127.0.0.1" 2>/dev/null || true)"
+    EFF_ROOT="$(printf '%s\n' "$EFF" | awk '/^permitrootlogin /{print $2}')"
+    EFF_PUBKEY="$(printf '%s\n' "$EFF" | awk '/^pubkeyauthentication /{print $2}')"
+
+    if [[ "$ADMIN_USER" == "root" && "$EFF_ROOT" == "no" ]]; then
+      err "REFUSING: effective PermitRootLogin=no while the admin user IS root."
+      err "That configuration cannot admit anyone. Removing the drop-in, not reloading."
+      rm -f "$DROP"; exit 1
+    fi
+    if [[ -n "$EFF_PUBKEY" && "$EFF_PUBKEY" != "yes" ]]; then
+      err "REFUSING: effective PubkeyAuthentication=${EFF_PUBKEY} with passwords disabled."
+      err "No login method would remain. Removing the drop-in, not reloading."
+      rm -f "$DROP"; exit 1
+    fi
+
     systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || service ssh reload
-    ok "SSH hardened (config validated + reloaded). Port ${SSH_PORT}, root+password OFF."
+    ok "SSH hardened (config validated + admin admissibility checked + reloaded)."
+    ok "  Port ${SSH_PORT}, PermitRootLogin=${ROOT_LOGIN}, passwords OFF, keys ON."
     warn "KEEP THIS SESSION OPEN. Verify a NEW ssh -p ${SSH_PORT} ${ADMIN_USER}@host works before closing."
+    warn "  If it fails: ssh -o IdentitiesOnly=yes, and check ~/.ssh/authorized_keys on the host."
   else
     err "sshd -t FAILED — removing drop-in, NOT reloading (no lock-out)."; rm -f "$DROP"; exit 1
   fi
