@@ -767,6 +767,41 @@ if $UPGRADE; then
   fi
   rm -f "$_new_compose"
 
+  # Backfill .env keys an upgrade introduced.
+  #
+  # The compose refresh above exists because a fix living in the compose could
+  # never reach an existing install. The same is true of .env, and it bit in
+  # exactly the same way: BUILDBUD_OWNER_USER_ID was added to the generator, but
+  # the generator only runs on a FRESH install. An upgraded instance got the new
+  # setup.sh, the new compose, the new image -- and no owner id. Project
+  # creation kept refusing with "an authenticated user is required to create a
+  # project", on every existing self-host install, silently.
+  #
+  # Strictly additive. Only keys that are ABSENT are appended; an existing value
+  # is never read, rewritten or reordered, because .env holds this instance's
+  # secrets and a rewrite is how you lose them.
+  _ensure_env_key() {
+    local key="$1" val="$2"
+    if ! grep -qE "^${key}=" "$ENV_FILE" 2>/dev/null; then
+      printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
+      info "  added missing ${key} to .env"
+      return 0
+    fi
+    return 1
+  }
+
+  if [ -f "$ENV_FILE" ]; then
+    _added=0
+    # Names the project owner on an install with no user accounts. Generated
+    # once and then preserved, because changing it would orphan every project
+    # this instance already owns.
+    _ensure_env_key BUILDBUD_OWNER_USER_ID \
+      "$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)" && _added=1
+    if [ "$_added" = "1" ]; then
+      info "  .env gained keys introduced since this instance was installed"
+    fi
+  fi
+
   # Record the image we are replacing, so it can be kept as a rollback target
   # when the orphan prune runs below.
   _prev_img="$(docker inspect buildbud-app --format '{{.Image}}' 2>/dev/null || true)"
