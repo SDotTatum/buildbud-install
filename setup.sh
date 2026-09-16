@@ -405,6 +405,8 @@ DOMAIN="localhost"
 DOMAIN_SET=false
 UPGRADE=false
 RESET=false
+ASSUME_YES=false
+{ [ "${BB_ASSUME_YES:-}" = "1" ] || [ "${BB_ASSUME_YES:-}" = "true" ]; } && ASSUME_YES=true
 LICENSE_FILE=""
 INSTALL_DEPS=true
 SHOW_TOKEN=false
@@ -420,6 +422,7 @@ while [[ $# -gt 0 ]]; do
     --upgrade) UPGRADE=true; shift ;;
     --enable-one-click-update) ENABLE_ONECLICK=true; shift ;;
     --reset) RESET=true; shift ;;
+    -y|--yes) ASSUME_YES=true; shift ;;
     --no-install-deps) INSTALL_DEPS=false; shift ;;
     --no-starter-project) SEED_STARTER=false; shift ;;
     --show-token) SHOW_TOKEN=true; shift ;;
@@ -908,9 +911,20 @@ fi
 
 # ─── Reset path ───────────────────────────────────────────────────────────────
 if $RESET; then
-  warn "This will delete ALL data and regenerate secrets. Continue? [y/N]"
-  read -r confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
+  if [ "$ASSUME_YES" != true ]; then
+    if [ -t 0 ]; then
+      warn "This will delete ALL data and regenerate secrets. Continue? [y/N]"
+      read -r confirm
+      [[ "$confirm" =~ ^[Yy]$ ]] || exit 0
+    else
+      # Fail-closed: a non-interactive --reset with no confirmation used to
+      # read EOF, fall through the || exit 0, and report success while
+      # wiping nothing. Refuse loudly instead of skipping silently.
+      error "Refusing --reset without confirmation on a non-interactive run."
+      error "Re-run with -y (or BB_ASSUME_YES=1) to wipe ALL data and regenerate secrets."
+      exit 1
+    fi
+  fi
   bb_compose down -v 2>/dev/null || true
   rm -f "$ENV_FILE"
   rm -rf "$SECRETS_DIR"
@@ -1070,6 +1084,70 @@ else
   CORS_ORIGINS="https://${DOMAIN},http://${DOMAIN}"
 fi
 
+# ─── Never let a regenerated .env blank a value the instance already had ──────
+#
+# `.env` is REGENERATED on every run, with previous values carried across by
+# _keep(). If any one of those carries returns empty, the instance silently
+# loses that setting — the key is still present, so nothing looks missing.
+#
+# Observed on a real install (2026-09-14): after `--upgrade`,
+# CLAUDE_CODE_OAUTH_TOKEN was present but EMPTY. The agent went from READY to
+# "no agent credential is configured". The instance was recoverable only because
+# an operator happened to have made a manual backup days earlier -- this script
+# took none. A customer would simply have lost their credential.
+#
+# _keep() itself was tested against that exact file afterwards and returned the
+# full 108-character token, so the fault is NOT in _keep and the root cause is
+# NOT established. This guard therefore does not depend on knowing it: it
+# compares before and after, restores from a backup taken moments earlier, and
+# refuses to continue. A guess about the cause would protect against one path;
+# this protects against all of them.
+_ENV_SNAPSHOT=""
+_snapshot_env_values() {
+  [ -f "$ENV_FILE" ] || return 0
+  _ENV_SNAPSHOT="$(mktemp)"
+  # KEY<TAB>length, for keys that currently hold a non-empty value.
+  while IFS= read -r line; do
+    case "$line" in ''#''*|"") continue ;; esac
+    case "$line" in *=*) : ;; *) continue ;; esac
+    _k="${line%%=*}"; _v="${line#*=}"
+    [ -n "$_v" ] && printf '%s\t%s\n' "$_k" "${#_v}" >> "$_ENV_SNAPSHOT"
+  done < "$ENV_FILE"
+}
+
+_assert_no_value_lost() {
+  [ -n "$_ENV_SNAPSHOT" ] && [ -f "$_ENV_SNAPSHOT" ] || return 0
+  _lost=""
+  while IFS="$(printf '\t')" read -r _k _len; do
+    [ -n "$_k" ] || continue
+    _now="$(grep -E "^${_k}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
+    [ -z "$_now" ] && _lost="$_lost $_k"
+  done < "$_ENV_SNAPSHOT"
+  rm -f "$_ENV_SNAPSHOT"; _ENV_SNAPSHOT=""
+
+  if [ -n "$_lost" ]; then
+    err "REFUSING: writing .env would have emptied values this instance already had:"
+    for _k in $_lost; do err "    $_k"; done
+    if [ -n "${_ENV_BACKUP:-}" ] && [ -f "$_ENV_BACKUP" ]; then
+      cp -a "$_ENV_BACKUP" "$ENV_FILE"
+      err "  .env restored from $_ENV_BACKUP — the instance is unchanged."
+    else
+      err "  NO BACKUP AVAILABLE. The previous .env is gone."
+    fi
+    exit 1
+  fi
+}
+
+# Timestamped backup BEFORE the regenerate, so a bad write is always reversible.
+# There was none before, which is why a lost credential was nearly unrecoverable.
+_ENV_BACKUP=""
+if [ -f "$ENV_FILE" ]; then
+  _ENV_BACKUP="${ENV_FILE}.bak-$(date -u '+%Y%m%dT%H%M%SZ')"
+  cp -a "$ENV_FILE" "$_ENV_BACKUP"
+  chmod 600 "$_ENV_BACKUP" 2>/dev/null || true
+fi
+_snapshot_env_values
+
 info "Writing .env..."
 cat > "$ENV_FILE" << EOF
 # BuildBud Self-Hosted — generated $(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -1112,6 +1190,8 @@ BB_CONTROL_DIR=${BB_CONTROL_DIR:-/var/lib/buildbud/update-control}
 BB_HUB_PUBKEY_PATH=${HOME}/.buildbud/hub-signing.pub
 BB_LICENSE_PATH=${HOME}/.buildbud/license.json
 EOF
+
+_assert_no_value_lost
 chmod 600 "$ENV_FILE"
 success ".env written"
 
