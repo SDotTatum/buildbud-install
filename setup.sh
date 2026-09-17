@@ -1139,13 +1139,13 @@ _assert_no_value_lost() {
   rm -f "$_ENV_SNAPSHOT"; _ENV_SNAPSHOT=""
 
   if [ -n "$_lost" ]; then
-    err "REFUSING: writing .env would have lost values this instance already had:"
-    for _k in $_lost; do err "    $_k"; done
+    error "REFUSING: writing .env would have lost values this instance already had:"
+    for _k in $_lost; do error "    $_k"; done
     if [ -n "${_ENV_BACKUP:-}" ] && [ -f "$_ENV_BACKUP" ]; then
       cp -a "$_ENV_BACKUP" "$ENV_FILE"
-      err "  .env restored from $_ENV_BACKUP — the instance is unchanged."
+      error "  .env restored from $_ENV_BACKUP — the instance is unchanged."
     else
-      err "  NO BACKUP AVAILABLE. The previous .env is gone."
+      error "  NO BACKUP AVAILABLE. The previous .env is gone."
     fi
     exit 1
   fi
