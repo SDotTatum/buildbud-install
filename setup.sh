@@ -1158,6 +1158,19 @@ if [ -f "$ENV_FILE" ]; then
   _ENV_BACKUP="${ENV_FILE}.bak-$(date -u '+%Y%m%dT%H%M%SZ')"
   cp -a "$ENV_FILE" "$_ENV_BACKUP"
   chmod 600 "$_ENV_BACKUP" 2>/dev/null || true
+  # If the script dies anywhere between the write below and the assert, .env is
+  # left half-written with no one to restore it. That is not hypothetical: it
+  # happened twice on a live instance while this guard was being built — once
+  # killed by set -e inside the guard, once at `err: command not found`. The
+  # snapshot is cleared by a completed assert, so this is a no-op on the normal
+  # path and fires only when the run ends early.
+  _env_restore_on_abort() {
+    [ -n "${_ENV_SNAPSHOT:-}" ] || return 0
+    [ -n "${_ENV_BACKUP:-}" ] && [ -f "$_ENV_BACKUP" ] || return 0
+    cp -a "$_ENV_BACKUP" "$ENV_FILE" 2>/dev/null || true
+    error "Aborted while .env was being written — restored from $_ENV_BACKUP"
+  }
+  trap _env_restore_on_abort EXIT
 fi
 _snapshot_env_values
 
@@ -1204,7 +1217,6 @@ BB_HUB_PUBKEY_PATH=${HOME}/.buildbud/hub-signing.pub
 BB_LICENSE_PATH=${HOME}/.buildbud/license.json
 EOF
 
-_assert_no_value_lost
 chmod 600 "$ENV_FILE"
 success ".env written"
 
@@ -1249,6 +1261,15 @@ if [[ -z "$PULL_TOKEN" ]]; then
   sed -i '/^BB_REPORT_TOKEN=/d;/^BB_INSTANCE_ID=/d' "$ENV_FILE"
   { echo "BB_REPORT_TOKEN=$REPORT_TOKEN"; echo "BB_INSTANCE_ID=$INSTANCE_ID"; } >> "$ENV_FILE"
 fi
+
+# Asserted HERE, not right after the heredoc, because .env is not finished until
+# this point. BB_REPORT_TOKEN and BB_INSTANCE_ID are written by the license block
+# above, ~45 lines after the template is laid down. Asserting earlier saw that
+# transient state as data loss and REFUSED every legitimate re-run on a
+# configured instance — the guard blocking the operation it was meant to protect.
+# Verified on a live install: "REFUSING ... BB_REPORT_TOKEN(removed)
+# BB_INSTANCE_ID(removed)" on a run where nothing was actually lost.
+_assert_no_value_lost
 
 # Pin the hub's Ed25519 public key so the instance can verify signed update
 # manifests (C2). This key is PUBLIC; the instance never gets the private key.
