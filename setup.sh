@@ -1120,13 +1120,26 @@ _assert_no_value_lost() {
   _lost=""
   while IFS="$(printf '\t')" read -r _k _len; do
     [ -n "$_k" ] || continue
-    _now="$(grep -E "^${_k}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
-    [ -z "$_now" ] && _lost="$_lost $_k"
+    # `|| true` is load-bearing. This file runs under `set -euo pipefail`, and
+    # grep exits 1 when the key is ABSENT — which is exactly the condition this
+    # guard exists to catch. Without it the pipeline fails, the assignment
+    # inherits status 1, and the script dies right here: silently, with no
+    # message and no restore, leaving the damaged .env the guard was added to
+    # prevent. Observed on a live instance — EXIT=1 after "Writing .env...",
+    # two keys gone, nothing logged.
+    _now="$(grep -E "^${_k}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+    if [ -z "$_now" ]; then
+      if grep -qE "^${_k}=" "$ENV_FILE" 2>/dev/null; then
+        _lost="$_lost ${_k}(emptied)"
+      else
+        _lost="$_lost ${_k}(removed)"
+      fi
+    fi
   done < "$_ENV_SNAPSHOT"
   rm -f "$_ENV_SNAPSHOT"; _ENV_SNAPSHOT=""
 
   if [ -n "$_lost" ]; then
-    err "REFUSING: writing .env would have emptied values this instance already had:"
+    err "REFUSING: writing .env would have lost values this instance already had:"
     for _k in $_lost; do err "    $_k"; done
     if [ -n "${_ENV_BACKUP:-}" ] && [ -f "$_ENV_BACKUP" ]; then
       cp -a "$_ENV_BACKUP" "$ENV_FILE"
