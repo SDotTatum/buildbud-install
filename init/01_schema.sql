@@ -3174,6 +3174,23 @@ ALTER TABLE public.verification_runs ENABLE ROW LEVEL SECURITY;
 -- Grants for PostgREST
 -- ============================================================
 GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role, authenticator;
+-- G91: project membership. Missing from this file until 2026-10-04, so since the
+-- 09-08 fail-closed change every project-scoped route 404'd on self-host installs.
+-- Same shape as bb_dev.project_members. Created before the GRANTs below so the
+-- table-wide grants and default privileges cover it.
+CREATE TABLE IF NOT EXISTS public.project_members (
+    id uuid DEFAULT gen_random_uuid() NOT NULL PRIMARY KEY,
+    project_id uuid NOT NULL REFERENCES public.projects(id) ON DELETE CASCADE,
+    user_id uuid NOT NULL,
+    role text DEFAULT 'member'::text NOT NULL CHECK (role = ANY (ARRAY['owner'::text, 'member'::text, 'viewer'::text])),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    UNIQUE (project_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_members_project_id ON public.project_members USING btree (project_id);
+CREATE INDEX IF NOT EXISTS idx_project_members_user_id ON public.project_members USING btree (user_id);
+ALTER TABLE public.project_members ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Service role has full access to project_members" ON public.project_members TO service_role USING (true) WITH CHECK (true);
+
 GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO anon;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
