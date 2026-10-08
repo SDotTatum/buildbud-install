@@ -597,6 +597,15 @@ SEEDJS
 # nothing improves.
 install_renew_timer() {
   local u; u="$(id -un)"
+  # The unit runs ${SCRIPT_DIR}/setup.sh daily. Run from a throwaway directory (a test or a
+  # mktemp checkout), it points at a path that is gone by the next boot: the unit fails
+  # 200/CHDIR forever (seen on bb-app, a /tmp/tmp.* install left 2026-09-17), and the failed
+  # unit pages daily. Refuse rather than install a timer that can never succeed.
+  case "${SCRIPT_DIR}" in
+    /tmp/*|/var/tmp/*|"${TMPDIR:-/nonexistent-tmpdir}"/*)
+      warn "Not installing the license renewal timer: setup.sh is running from a temporary directory (${SCRIPT_DIR}). Re-run it from the permanent install directory to enable renewal."
+      return 0 ;;
+  esac
   info "Installing daily license renewal timer (user $u)..."
   _priv tee /etc/systemd/system/buildbud-license-renew.service >/dev/null <<UNIT
 [Unit]
