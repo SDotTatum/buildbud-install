@@ -20,6 +20,32 @@ st(){ # state phase message [target_version_json]
 }
 dc(){ docker compose -f "$COMPOSE" "$@"; }
 
+# Remove every local image of the app repo (and old rollback tags) EXCEPT the
+# image IDs given as arguments, then drop dangling layers (G226).
+#
+# `docker image prune -f` alone reclaimed nothing on a real install: the v2
+# apply pulls by digest (repo@sha256:...), and an image pulled that way keeps a
+# repo-digest reference after :prod moves on, so it is never "dangling". thesue
+# logged "pruned orphaned images: 2033968K -> 2033968K free" on every apply
+# while six old 4.6GB images filled its 38G disk, and the next pull died
+# extracting a layer. Selecting by repository catches both shapes.
+reclaim_images(){ # phase keep_id...
+  local phase="$1"; shift
+  local repo="${IMG_REF%:*}" id k keep before after n=0
+  [ -n "$repo" ] && [ "$#" -gt 0 ] || { lg "reclaim($phase) skipped: repo='$repo' keep=$#"; return 0; }
+  before="$(df -P / | awk 'NR==2{print $4}')"
+  for id in $( { docker images --no-trunc --format '{{.ID}}' "$repo"; \
+                 docker images --no-trunc --format '{{.ID}}' buildbud-rollback; } 2>/dev/null | sort -u); do
+    keep=0
+    for k in "$@"; do [ "$id" = "$k" ] && keep=1; done
+    [ "$keep" = 1 ] && continue
+    docker rmi -f "$id" >>"$LOG" 2>&1 && n=$((n+1))
+  done
+  docker image prune -f >>"$LOG" 2>&1 || true
+  after="$(df -P / | awk 'NR==2{print $4}')"
+  lg "reclaim($phase): removed $n image(s), ${before}K -> ${after}K free (kept: $*)"
+}
+
 [ -f "$REQ" ] || exit 0
 [ -f "$COMPOSE" ] || { st failed precheck "compose file not found"; exit 1; }
 
@@ -45,6 +71,14 @@ if dc exec -T postgres pg_dumpall -U postgres >"$CONTROL_DIR/pre-update-$(date -
 # 3. pull + recreate the app (v2: pin to the digest-addressed target when the
 #    manifest supplied one, so the apply is immune to the :prod tag drifting
 #    between manifest-publish and apply; falls back to the compose tag pull).
+# 2b. Make room BEFORE pulling. A disk that a broken prune already filled can
+#     otherwise never pull again, so the box could not even install the fix.
+#     Keeps the running image and the current rollback target; nothing else of
+#     ours is needed until the new image is healthy.
+st applying reclaim "freeing disk space" "$TV"
+RB_IMG="$(docker image inspect --format '{{.Id}}' buildbud-rollback:previous 2>/dev/null || true)"
+if [ -n "$PREV_IMG" ]; then reclaim_images pre-pull "$PREV_IMG" $RB_IMG; else lg "reclaim(pre-pull) skipped: no running app image"; fi
+
 st applying pull "pulling new image" "$TV"
 TARGET_IMG="$(sed -n 's/.*"target_image" *: *"\([^"]*\)".*/\1/p' "$WORK" | head -1)"
 if [ -n "$TARGET_IMG" ] && printf '%s' "$TARGET_IMG" | grep -q '@sha256:'; then
@@ -87,10 +121,16 @@ if [ "$ok" = 1 ]; then
   if [ -n "$PREV_IMG" ]; then
     docker tag "$PREV_IMG" buildbud-rollback:previous >>"$LOG" 2>&1 || true
   fi
-  before="$(df -P / | awk 'NR==2{print $4}')"
-  docker image prune -f >>"$LOG" 2>&1 || true
-  after="$(df -P / | awk 'NR==2{print $4}')"
-  lg "pruned orphaned images: ${before}K -> ${after}K free (rollback target kept as buildbud-rollback:previous)"
+  NEW_CID="$(dc ps -q buildbud 2>/dev/null | head -1)"
+  NEW_IMG="$(docker inspect --format '{{.Image}}' "$NEW_CID" 2>/dev/null || true)"
+  if [ -n "$NEW_IMG" ] && [ -n "$PREV_IMG" ]; then
+    reclaim_images post-healthy "$NEW_IMG" "$PREV_IMG"
+  else
+    # Without both IDs we cannot tell the rollback target from an orphan; leave
+    # them all and only drop dangling layers.
+    docker image prune -f >>"$LOG" 2>&1 || true
+    lg "reclaim(post-healthy) limited to dangling: new='$NEW_IMG' prev='$PREV_IMG'"
+  fi
 else
   # 5. rollback: re-point the local tag to the previous image + recreate
   lg "unhealthy — rolling back to $PREV_IMG"
