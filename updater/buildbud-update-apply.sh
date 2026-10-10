@@ -103,6 +103,12 @@ done
 
 if [ "$ok" = 1 ]; then
   st healthy done "update applied and healthy" "$TV"; lg "healthy"; rm -f "$WORK"
+  # The ONLY write of running.json (G228). status.json is overwritten by the next
+  # request or failure, so the app reads what runs from here. A failed pull or a
+  # rollback leaves it alone: the image it names is still the one running.
+  RUN_IMG="$(docker inspect --format '{{.Image}}' "$(dc ps -q buildbud 2>/dev/null | head -1)" 2>/dev/null || true)"
+  printf '{"version":%s,"image_id":"%s","updated_at":"%s"}\n' "$TV" "$RUN_IMG" "$(ts)" \
+    >"$CONTROL_DIR/running.json.tmp" 2>/dev/null && mv -f "$CONTROL_DIR/running.json.tmp" "$CONTROL_DIR/running.json"
   # 4b. Reclaim the images this update orphaned.
   #
   # `docker compose pull` re-points the :prod tag and leaves the OLD image
