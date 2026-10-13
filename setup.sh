@@ -309,6 +309,32 @@ open(sys.argv[2],"w").write(json.dumps(out,indent=2)+"\n")' "$bundle" "$out" || 
   chmod 644 "$out"
 }
 
+# G232: the app container is the only reader of the dispatch signing key, and it
+# runs as uid 1000 (Dockerfile.web `USER node`). Docker bind-mounts the FILE, so
+# the 0700 secrets dir never gates the container; the file's own owner and mode
+# do. `chmod 600` as the installing user left the key readable by exactly the one
+# uid that never opens it, and every dispatch path fails closed on that.
+#
+# Owner = app uid, group = the installing user's (so the public-half repair can
+# still read it on a later run), 0440. Both go through _priv: once the file
+# belongs to the app uid a non-root installer can no longer chmod it itself.
+# Without root or sudo the chown cannot work; fall back to 0644 inside the 0700
+# secrets dir (the same exposure bb_write_license_status accepts) and say so,
+# rather than leave an install that silently cannot dispatch.
+#
+# Called from BOTH the fresh-install path and the --upgrade block: --upgrade
+# exits before the fresh-install key block (the G104 shape), and the first G232
+# fix (#1344) sat only there, so `setup.sh --upgrade` left thesue at 0:0 0600.
+bb_signing_key_perms() {
+  local key="$1/dispatch-signing.pem" uid="${BB_APP_UID:-1000}"
+  [ -f "$key" ] || return 0
+  if _priv chown "$uid:$(id -g)" "$key" 2>/dev/null && _priv chmod 440 "$key" 2>/dev/null; then
+    return 0
+  fi
+  chmod 644 "$key" 2>/dev/null || true
+  warn "could not give dispatch-signing.pem to uid $uid (no root or sudo); left it 0644 inside the 0700 secrets dir"
+}
+
 # Install a verified bundle: in-place rewrite, env re-extract, status file, login.
 #
 # IN PLACE, never mv/rename. A bind-mounted single file follows the INODE, so an
@@ -866,6 +892,10 @@ if $UPGRADE; then
   # `up -d` runs Docker silently creates a DIRECTORY there instead.
   [ -f "$(bb_license_path)" ] && bb_write_license_status "$(bb_license_path)" || true
 
+  # G232: same shape as G104 below -- the fresh-install key block never runs on
+  # --upgrade, so existing installs only get the app-readable key from here.
+  bb_signing_key_perms "$SECRETS_DIR"
+
   # G104: the fresh-install path writes secrets/hub-signing.pub at a line that
   # sits AFTER this block's `exit 0`, while the comment there claims it runs on
   # every run "(incl. --upgrade)". It does not, so an upgrade-only instance
@@ -1044,28 +1074,7 @@ elif [ ! -s "$SECRETS_DIR/dispatch-signing.pub" ]; then
   # the pair unusable: a guard that only stops writing can strand broken state.
   openssl pkey -in "$SECRETS_DIR/dispatch-signing.pem" -pubout -out "$SECRETS_DIR/dispatch-signing.pub" 2>/dev/null
 fi
-# G232: the app container is the only reader of the private key, and it runs as
-# uid 1000 (Dockerfile.web `USER node`). Docker bind-mounts the FILE, so the 0700
-# secrets dir never gates the container; the file's own owner and mode do.
-# `chmod 600` as the installing user left the key readable by exactly the one uid
-# that never opens it, and every dispatch path fails closed on that.
-#
-# Owner = app uid, group = the installing user's (so the public-half repair above
-# can still read it on a later run), 0440. Both go through _priv: once the file
-# belongs to the app uid a non-root installer can no longer chmod it itself.
-# This runs on every invocation, so `setup.sh --upgrade` repairs existing installs.
-#
-# Without root or sudo the chown cannot work; fall back to 0644 inside the 0700
-# secrets dir (the same exposure bb_write_license_status accepts) and say so,
-# rather than leave an install that silently cannot dispatch.
-BB_APP_UID="${BB_APP_UID:-1000}"
-if _priv chown "$BB_APP_UID:$(id -g)" "$SECRETS_DIR/dispatch-signing.pem" 2>/dev/null \
-   && _priv chmod 440 "$SECRETS_DIR/dispatch-signing.pem" 2>/dev/null; then
-  :
-else
-  chmod 644 "$SECRETS_DIR/dispatch-signing.pem" 2>/dev/null || true
-  warn "could not give dispatch-signing.pem to uid $BB_APP_UID (no root or sudo); left it 0644 inside the 0700 secrets dir"
-fi
+bb_signing_key_perms "$SECRETS_DIR"
 chmod 644 "$SECRETS_DIR/dispatch-signing.pub"
 
 # Generate PostgREST JWT tokens (HS256, signed with JWT_SECRET)
