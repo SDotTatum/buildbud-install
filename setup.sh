@@ -297,8 +297,8 @@ if min_exp and e <= int(min_exp):
 # nothing. The shape still satisfies feedback-reporter's file-first branch, so a
 # renewed reportToken reaches a RUNNING container with no recreate.
 #
-# 0644 inside the 0700 secrets dir: the container runs as uid 1001 and only
-# reads 0600 files today by coincidence of the installing user's uid.
+# 0644 inside the 0700 secrets dir: the container runs as uid 1000 (USER node)
+# and cannot read the installing user's 0600 files (G232 hit exactly this).
 bb_write_license_status() {
   local bundle="$1" out="$SECRETS_DIR/license-container.json"
   mkdir -p "$SECRETS_DIR"
@@ -1044,7 +1044,28 @@ elif [ ! -s "$SECRETS_DIR/dispatch-signing.pub" ]; then
   # the pair unusable: a guard that only stops writing can strand broken state.
   openssl pkey -in "$SECRETS_DIR/dispatch-signing.pem" -pubout -out "$SECRETS_DIR/dispatch-signing.pub" 2>/dev/null
 fi
-chmod 600 "$SECRETS_DIR/dispatch-signing.pem"
+# G232: the app container is the only reader of the private key, and it runs as
+# uid 1000 (Dockerfile.web `USER node`). Docker bind-mounts the FILE, so the 0700
+# secrets dir never gates the container; the file's own owner and mode do.
+# `chmod 600` as the installing user left the key readable by exactly the one uid
+# that never opens it, and every dispatch path fails closed on that.
+#
+# Owner = app uid, group = the installing user's (so the public-half repair above
+# can still read it on a later run), 0440. Both go through _priv: once the file
+# belongs to the app uid a non-root installer can no longer chmod it itself.
+# This runs on every invocation, so `setup.sh --upgrade` repairs existing installs.
+#
+# Without root or sudo the chown cannot work; fall back to 0644 inside the 0700
+# secrets dir (the same exposure bb_write_license_status accepts) and say so,
+# rather than leave an install that silently cannot dispatch.
+BB_APP_UID="${BB_APP_UID:-1000}"
+if _priv chown "$BB_APP_UID:$(id -g)" "$SECRETS_DIR/dispatch-signing.pem" 2>/dev/null \
+   && _priv chmod 440 "$SECRETS_DIR/dispatch-signing.pem" 2>/dev/null; then
+  :
+else
+  chmod 644 "$SECRETS_DIR/dispatch-signing.pem" 2>/dev/null || true
+  warn "could not give dispatch-signing.pem to uid $BB_APP_UID (no root or sudo); left it 0644 inside the 0700 secrets dir"
+fi
 chmod 644 "$SECRETS_DIR/dispatch-signing.pub"
 
 # Generate PostgREST JWT tokens (HS256, signed with JWT_SECRET)
